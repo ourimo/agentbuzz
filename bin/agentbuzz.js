@@ -1,0 +1,384 @@
+#!/usr/bin/env node
+/**
+ * agentbuzz — CLI.
+ *
+ *   npx agentbuzz init        detect Claude Code, merge hooks, pair, test
+ *   npx agentbuzz test        send a realistic notification
+ *   npx agentbuzz status      what the hook has actually been doing
+ *   npx agentbuzz uninstall   remove our hooks, leave everyone else's alone
+ *
+ * The hook itself is runtime/hook.mjs, which init copies into the config
+ * directory. This file is only ever run by a human.
+ */
+
+import { readFileSync, writeFileSync, copyFileSync, mkdirSync, existsSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { homedir } from 'node:os';
+import { randomBytes } from 'node:crypto';
+import { createInterface } from 'node:readline/promises';
+import { hostname } from 'node:os';
+
+import {
+  CONFIG_DIR, loadConfig, saveConfig, DEFAULTS,
+  runHook, deliver, humanDuration, readLog
+} from '../runtime/hook.mjs';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const RUNTIME_SRC = join(HERE, '..', 'runtime', 'hook.mjs');
+const RUNTIME_DST = join(CONFIG_DIR, 'hook.mjs');
+// Overridable so the installer can be tested without touching a real config.
+const CLAUDE_SETTINGS = process.env.AGENTBUZZ_CLAUDE_SETTINGS || join(homedir(), '.claude', 'settings.json');
+const API = process.env.AGENTBUZZ_API || 'https://europe-west1-agentnotify.cloudfunctions.net/api';
+
+/** Every event we mount. Chosen from what the installed Claude Code actually
+ *  emits — `PermissionRequest` was found empirically in a live setup, not
+ *  inferred from docs, and it is the most valuable of the four. */
+const EVENTS = ['UserPromptSubmit', 'Stop', 'StopFailure', 'Notification', 'PermissionRequest'];
+
+/* ── tiny terminal helpers ──────────────────────────────────────────────── */
+const tty = process.stdout.isTTY;
+const c = (code, s) => (tty ? `\x1b[${code}m${s}\x1b[0m` : s);
+const dim = (s) => c('2', s), bold = (s) => c('1', s);
+const green = (s) => c('32', s), amber = (s) => c('33', s), red = (s) => c('31', s);
+const ok = (s) => console.log(`  ${green('✓')} ${s}`);
+const info = (s) => console.log(`  ${dim('·')} ${s}`);
+const warn = (s) => console.log(`  ${amber('!')} ${s}`);
+const err = (s) => console.log(`  ${red('✗')} ${s}`);
+
+const args = process.argv.slice(2);
+const flag = (name) => args.includes(`--${name}`);
+const opt = (name, fallback = null) => {
+  const i = args.indexOf(`--${name}`);
+  return i !== -1 && args[i + 1] && !args[i + 1].startsWith('--') ? args[i + 1] : fallback;
+};
+
+async function confirm(question, def = true) {
+  if (flag('yes')) return true;
+  if (!process.stdin.isTTY) return def;
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const a = (await rl.question(`  ${question} ${dim(def ? '(Y/n)' : '(y/N)')} `)).trim().toLowerCase();
+  rl.close();
+  return a === '' ? def : a.startsWith('y');
+}
+
+/* ── settings.json: detect, back up, MERGE ──────────────────────────────── */
+
+/// Recognises our hooks under every name this tool has had. It was agentnotify,
+/// then briefly agentping — npm rejected both as too similar to existing
+/// packages (agent-notify, agent-ping). Anyone carrying hooks from an earlier
+/// build must have them REPLACED rather than added beside, or every
+/// notification arrives twice.
+const isOurs = (cmd) => /agent-?notify|agentping|agentbuzz/.test(String(cmd));
+
+function readSettings(path) {
+  if (!existsSync(path)) return { exists: false, data: {} };
+  try {
+    return { exists: true, data: JSON.parse(readFileSync(path, 'utf8')) };
+  } catch (e) {
+    // Malformed settings.json is a real case in the wild. Refuse rather than
+    // "fix" it — silently rewriting someone's config is how you lose a user.
+    return { exists: true, data: null, error: e.message };
+  }
+}
+
+function backup(path) {
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+/, '').replace('T', '');
+  const dst = `${path}.${stamp}.bak`;
+  copyFileSync(path, dst);
+  return dst;
+}
+
+/** Strip only OUR hook entries, preserving everyone else's. */
+function stripOurs(hooks) {
+  const out = {};
+  let removed = 0;
+  for (const [event, entries] of Object.entries(hooks ?? {})) {
+    const kept = [];
+    for (const entry of entries ?? []) {
+      const inner = (entry.hooks ?? []).filter((h) => {
+        if (isOurs(h.command)) { removed++; return false; }
+        return true;
+      });
+      if (inner.length) kept.push({ ...entry, hooks: inner });
+    }
+    if (kept.length) out[event] = kept;
+  }
+  return { hooks: out, removed };
+}
+
+function addOurs(hooks) {
+  const out = { ...hooks };
+  for (const event of EVENTS) {
+    const entry = {
+      hooks: [{
+        type: 'command',
+        // async so a notification can never cost the user latency, and a hard
+        // timeout so it can never hang a session even if async changed.
+        async: true,
+        timeout: 10,
+        command: `node ${RUNTIME_DST}`
+      }]
+    };
+    out[event] = [...(out[event] ?? []), entry];
+  }
+  return out;
+}
+
+/* ── commands ───────────────────────────────────────────────────────────── */
+
+async function cmdInit() {
+  console.log(`\n${bold('agentbuzz')} ${dim('· setup')}\n`);
+
+  // 1. Detect
+  const s = readSettings(CLAUDE_SETTINGS);
+  if (!s.exists) {
+    err(`No Claude Code settings found at ${CLAUDE_SETTINGS}`);
+    info('Install and run Claude Code once, then try again.');
+    process.exitCode = 1;
+    return;
+  }
+  if (s.data === null) {
+    err(`${CLAUDE_SETTINGS} is not valid JSON — ${s.error}`);
+    info('Fix or move that file first. Refusing to rewrite it.');
+    process.exitCode = 1;
+    return;
+  }
+  ok(`Found Claude Code  ${dim(CLAUDE_SETTINGS)}`);
+
+  const existingHooks = s.data.hooks ?? {};
+  const otherCount = Object.values(existingHooks).flat()
+    .flatMap((e) => e.hooks ?? []).filter((h) => !isOurs(h.command)).length;
+  const oursCount = Object.values(existingHooks).flat()
+    .flatMap((e) => e.hooks ?? []).filter((h) => isOurs(h.command)).length;
+
+  if (otherCount) info(`${otherCount} hook${otherCount === 1 ? '' : 's'} from other tools — these will be preserved`);
+  if (oursCount) warn(`${oursCount} existing agentbuzz hook${oursCount === 1 ? '' : 's'} — these will be replaced`);
+
+  if (!(await confirm('Configure it for notifications?'))) { info('Nothing changed.'); return; }
+
+  // 2. Channel.
+  const cfg = loadConfig();
+  cfg.threshold = Number(opt('threshold', cfg.threshold ?? DEFAULTS.threshold));
+
+  // The hosted relay is the default — it is the product, and it is what
+  // delivers to the app and the Watch. `--ntfy` is the escape hatch for people
+  // who would rather not route anything through us.
+  const useRelay = !flag('ntfy') && cfg.channel?.type !== 'ntfy' || flag('relay');
+  if (useRelay) {
+    const paired = await pairWithPhone();
+    if (!paired) { err('Pairing did not complete — nothing was changed.'); process.exitCode = 1; return; }
+    cfg.channel = { type: 'relay', endpoint: `${API}/v1/ingest`, key: paired.apiKey };
+  } else {
+    // A long random ntfy topic is the ONLY thing protecting it: ntfy.sh topics
+    // are unauthenticated, and anyone who guesses the name reads one-line
+    // summaries of what you are building.
+    const topic = opt('topic') || cfg.channel?.topic || `agentbuzz-${randomBytes(9).toString('hex')}`;
+    cfg.channel = { type: 'ntfy', base: opt('server', 'https://ntfy.sh'), topic };
+  }
+
+  // 3. Back up, then merge.
+  const bak = backup(CLAUDE_SETTINGS);
+  ok(`Backed up  ${dim(bak.replace(homedir(), '~'))}`);
+
+  const stripped = stripOurs(existingHooks);
+  s.data.hooks = addOurs(stripped.hooks);
+  writeFileSync(CLAUDE_SETTINGS, JSON.stringify(s.data, null, 2) + '\n');
+  ok(`Added hooks  ${dim(EVENTS.join(', '))}`);
+
+  // 4. Vendor the runtime so the hook command survives npx's temp directory.
+  mkdirSync(CONFIG_DIR, { recursive: true });
+  copyFileSync(RUNTIME_SRC, RUNTIME_DST);
+  saveConfig(cfg);
+  ok(`Installed  ${dim(RUNTIME_DST.replace(homedir(), '~'))}`);
+
+  // 5. Confirm delivery in both directions.
+  if (cfg.channel.type === 'ntfy') {
+    console.log(`\n  Subscribe to this topic in the ${bold('ntfy')} app:\n`);
+    console.log(`      ${bold(cfg.channel.topic)}`);
+    console.log(`      ${dim(`${cfg.channel.base}/${cfg.channel.topic}`)}\n`);
+    info('iOS: set ntfy to Time Sensitive in Settings → Notifications, so blocked-agent');
+    info('pings pierce Focus. Your Watch mirrors them automatically.');
+  }
+
+  if (await confirm('\n  Send a test notification now?')) await sendTest(cfg);
+
+  // 6. Say the restart line out loud. Hooks are snapshotted at session start;
+  //    skipping this makes users conclude it is broken within 60 seconds.
+  console.log(`\n  ${bold('Restart Claude Code')} to load the hooks.`);
+  console.log(`  You'll be pinged when a run takes longer than ${bold(cfg.threshold + 's')} — short turns stay quiet.\n`);
+}
+
+/**
+ * Pairing, as designed in PLAN.md §4: the first notification lands before an
+ * account exists. We ask the relay for a code, show it, and poll. The phone
+ * claims it and the key comes back here — no email, no password in front of
+ * the aha moment.
+ *
+ * The code is a credential: whoever redeems it receives this machine's
+ * notifications. It is single-use and expires in ten minutes.
+ */
+async function pairWithPhone() {
+  const machine = hostname();
+  let start;
+  try {
+    const res = await fetch(`${API}/v1/pair/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ machine }),
+      signal: AbortSignal.timeout(10000)
+    });
+    start = await res.json();
+    if (!res.ok) throw new Error(start?.error ?? `http ${res.status}`);
+  } catch (e) {
+    err(`Could not reach the relay — ${e.message}`);
+    return null;
+  }
+
+  console.log(`\n  Open ${bold('agentbuzz')} on your iPhone and enter this code:\n`);
+  console.log(`      ${bold(start.code)}`);
+  console.log(`      ${dim(start.pairUrl)}\n`);
+
+  const deadline = Date.parse(new Date(start.expiresAt).toISOString());
+  process.stdout.write(`  ${dim('Waiting for your phone…')}`);
+
+  for (;;) {
+    if (Date.now() > deadline) { console.log(`\r  ${red('Code expired.')}            `); return null; }
+    await new Promise((r) => setTimeout(r, 2000));
+    try {
+      const res = await fetch(`${API}/v1/pair/poll?code=${encodeURIComponent(start.code)}`, {
+        signal: AbortSignal.timeout(10000)
+      });
+      const p = await res.json();
+      if (p.expired) { console.log(`\r  ${red('Code expired.')}            `); return null; }
+      if (p.claimed && p.apiKey) {
+        console.log(`\r  ${green('✓')} Connected  ${dim(machine)}                `);
+        return p;
+      }
+    } catch { /* transient — keep polling until the code expires */ }
+  }
+}
+
+/** A test notification must look like a REAL one. "Test notification" proves
+ *  the pipe works but demonstrates nothing; the enrichment is the pitch. */
+async function sendTest(cfg = loadConfig()) {
+  if (!cfg.channel) { err('No channel configured. Run: agentbuzz init'); process.exitCode = 1; return; }
+  const note = {
+    project: 'agentbuzz', status: 'done',
+    title: 'agentbuzz — done', rawTitle: 'agentbuzz — done',
+    summary: 'Setup complete. This is what a finished run looks like.',
+    body: 'Setup complete. This is what a finished run looks like.\n— 12× Read, 4× Edit, 1× Bash · 1m 12s',
+    prio: 'default', tags: 'white_check_mark', elapsed: 72
+  };
+  const t0 = Date.now();
+  try {
+    const res = await deliver(cfg.channel, note);
+    if (res.ok) ok(`Test notification delivered in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    else { err(`Delivery failed — ${res.detail}`); process.exitCode = 1; }
+  } catch (e) {
+    err(`Delivery failed — ${e.message}`);
+    process.exitCode = 1;
+  }
+}
+
+async function cmdUninstall() {
+  console.log(`\n${bold('agentbuzz')} ${dim('· uninstall')}\n`);
+  const s = readSettings(CLAUDE_SETTINGS);
+  if (!s.exists || s.data === null) { err('No readable settings.json — nothing to do.'); return; }
+
+  const { hooks, removed } = stripOurs(s.data.hooks ?? {});
+  if (!removed) { info('No agentbuzz hooks found.'); return; }
+
+  const bak = backup(CLAUDE_SETTINGS);
+  if (Object.keys(hooks).length) s.data.hooks = hooks; else delete s.data.hooks;
+  writeFileSync(CLAUDE_SETTINGS, JSON.stringify(s.data, null, 2) + '\n');
+
+  ok(`Backed up  ${dim(bak.replace(homedir(), '~'))}`);
+  ok(`Removed ${removed} agentbuzz hook${removed === 1 ? '' : 's'} — every other hook left alone`);
+  info(`Config kept at ${CONFIG_DIR.replace(homedir(), '~')} — delete it by hand if you want it gone.`);
+  console.log(`\n  ${bold('Restart Claude Code')} to apply.\n`);
+}
+
+/** The silence problem: with a threshold, a working install can be silent for
+ *  an hour, and silence is indistinguishable from broken. This command is the
+ *  answer — it shows what was seen and deliberately swallowed. */
+function cmdStatus() {
+  const cfg = loadConfig();
+  const log = readLog();
+  console.log(`\n${bold('agentbuzz')} ${dim('· status')}\n`);
+
+  if (!cfg.channel) { warn('No channel configured. Run: agentbuzz init'); return; }
+  info(`Channel    ${cfg.channel.type} · ${cfg.channel.topic ?? cfg.channel.endpoint}`);
+  info(`Threshold  ${cfg.threshold}s`);
+  const installed = existsSync(RUNTIME_DST) && /agent-?notify/.test(
+    existsSync(CLAUDE_SETTINGS) ? readFileSync(CLAUDE_SETTINGS, 'utf8') : ''
+  );
+  info(`Hooks      ${installed ? green('installed') : red('NOT installed')}`);
+
+  if (!log.length) {
+    console.log(`\n  ${amber('No events logged yet.')}`);
+    console.log(`  ${dim('If you have used Claude Code since installing, the hooks are not firing —')}`);
+    console.log(`  ${dim('did you restart it? Hooks are snapshotted at session start.')}\n`);
+    return;
+  }
+
+  const by = (k) => log.reduce((m, e) => (m[e[k]] = (m[e[k]] ?? 0) + 1, m), {});
+  const actions = by('action');
+  const sent = actions.sent ?? 0;
+  const quiet = (actions['suppressed-short'] ?? 0) + (actions['suppressed-dupe'] ?? 0);
+  const errors = actions.error ?? 0;
+
+  const last = log[log.length - 1];
+  const ago = humanDuration(Math.max(0, Math.floor((Date.now() - Date.parse(last.ts)) / 1000)));
+
+  console.log(`\n  ${bold(`Listening · last run ${ago} ago`)} ${dim(`(${last.project}, ${last.elapsed}s, ${last.action})`)}\n`);
+  console.log(`  ${green(String(sent))} sent   ${dim(`${quiet} stayed quiet`)}${errors ? `   ${red(`${errors} errors`)}` : ''}`);
+
+  const durations = log.filter((e) => e.event === 'Stop').map((e) => e.elapsed).sort((a, b) => a - b);
+  if (durations.length) {
+    const at = (p) => durations[Math.min(durations.length - 1, Math.floor(durations.length * p))];
+    const over = durations.filter((d) => d >= cfg.threshold).length;
+    console.log(`  ${dim(`turn duration: median ${at(0.5)}s · p90 ${at(0.9)}s · max ${durations[durations.length - 1]}s`)}`);
+    console.log(`  ${dim(`${over} of ${durations.length} turns crossed the ${cfg.threshold}s threshold`)}`);
+    if (sent === 0 && durations.length >= 10) {
+      console.log(`\n  ${amber('Nothing has been sent yet.')} Try a lower threshold:`);
+      console.log(`  ${dim(`agentbuzz config --threshold ${Math.max(30, at(0.9))}`)}`);
+    }
+  }
+  console.log();
+}
+
+function cmdConfig() {
+  const cfg = loadConfig();
+  const t = opt('threshold');
+  if (t !== null) { cfg.threshold = Number(t); saveConfig(cfg); ok(`Threshold set to ${cfg.threshold}s`); return; }
+  console.log(JSON.stringify(cfg, null, 2));
+}
+
+async function cmdHook() {
+  let raw = '';
+  for await (const chunk of process.stdin) raw += chunk;
+  let payload; try { payload = JSON.parse(raw); } catch { return; }
+  const r = await runHook(payload, { dryRun: flag('dry-run') });
+  if (flag('dry-run')) console.log(JSON.stringify(r, null, 2));
+}
+
+function usage() {
+  console.log(`
+${bold('agentbuzz')} — know the second your agent needs you
+
+  ${bold('init')}        detect Claude Code, back up and merge hooks, send a test
+  ${bold('test')}        send a notification that looks like a real one
+  ${bold('status')}      what the hook has been doing, and why it has been quiet
+  ${bold('config')}      print config, or ${dim('--threshold <seconds>')} to change it
+  ${bold('uninstall')}   remove only our hooks, restore nothing else
+  ${bold('hook')}        internal: the hook entrypoint ${dim('(--dry-run to inspect)')}
+
+  ${dim('init flags:')} --ntfy (deliver via ntfy.sh instead of the app)  --topic <name>
+              --threshold <sec>  --server <url>  --yes
+`);
+}
+
+const cmd = args.find((a) => !a.startsWith('--'));
+const table = { init: cmdInit, test: () => sendTest(), status: cmdStatus, config: cmdConfig, uninstall: cmdUninstall, hook: cmdHook };
+await (table[cmd] ?? usage)();

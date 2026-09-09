@@ -1,0 +1,37 @@
+{
+  "name": "agentbuzz",
+  "version": "1.0.0",
+  "description": "Know the second your agent needs you \u2014 Claude Code notifications on your phone and Apple Watch, and answer them from your wrist.",
+  "keywords": [
+    "claude-code",
+    "notifications",
+    "hooks",
+    "agent",
+    "apple-watch",
+    "push",
+    "ntfy"
+  ],
+  "homepage": "https://agentnotify.web.app",
+  "bugs": {
+    "url": "https://agentnotify.web.app/support"
+  },
+  "license": "MIT",
+  "author": "Aurimas Paliukaitis",
+  "type": "module",
+  "bin": {
+    "agentbuzz": "bin/agentbuzz.js"
+  },
+  "files": [
+    "bin",
+    "runtime",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.17"
+  },
+  "scripts": {
+    "test": "node test/run.mjs",
+    "grade": "node scripts/grade-summaries.mjs"
+  }
+}
