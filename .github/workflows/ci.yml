@@ -1,0 +1,23 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # 18.17 is the floor declared in package.json; 22 is what most people
+        # actually run. Both, because the hook must not break on either.
+        node: ['18.17', '22']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      # No install step on purpose — this package has zero dependencies, and a
+      # CI that never runs `npm install` is a standing proof of that.
+      - run: node test/run.mjs

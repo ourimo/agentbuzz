@@ -1,42 +1,81 @@
 # agentbuzz
 
-Know the second your agent needs you. Notifications from Claude Code to your
-phone and Apple Watch — when a run finishes, fails, or stops for permission.
+**Unblock your agent from your wrist.** When Claude Code stops for permission,
+the prompt lands on your iPhone and Apple Watch — tap Allow, or dictate the next
+instruction, and it carries on. It also tells you when a run finishes or breaks.
 
 ```bash
 npx agentbuzz init
 ```
 
-## What it does
+[agentnotify.web.app](https://agentnotify.web.app) · [support](https://agentnotify.web.app/support)
 
-Registers hooks with Claude Code and, when something worth interrupting you for
-happens, sends a one-line summary to your phone.
+This repository is the **local client**: the hook runtime that runs on your
+machine, and the installer that wires it into Claude Code. It is the part that
+reads your transcripts, so it is the part worth reading before you run it.
 
-| Command | |
-|---|---|
-| `init` | Detect Claude Code, back up and **merge** hooks, pair a channel, send a test |
-| `test` | Send a notification that looks like a real one |
-| `status` | What the hook has been doing — and why it has been quiet |
-| `config` | Print config, or `--threshold <seconds>` to change it |
-| `uninstall` | Remove only our hooks; everything else is left alone |
+---
 
 ## Your code never leaves your machine
 
 A Claude Code hook hands us a **file path**, not a conversation. The transcript
-is read locally to build the summary; only that summary is sent. No file
-contents, no diffs, no prompts, no tool output.
+is read locally to build a one-line summary, and only that summary is sent:
 
-This is not a policy — it is the only architecture that works, and it is why the
-enrichment is a local script rather than a server.
+```json
+{ "project": "checkout", "status": "blocked",
+  "title": "wants permission to use Bash", "body": "npm run migrate:prod",
+  "duration": 372 }
+```
+
+No file contents, no diffs, no prompts, no tool output. This is not a policy —
+it is the only architecture that works, and it is why enrichment is a local
+script rather than a server. Read [`runtime/hook.mjs`](runtime/hook.mjs) and
+check.
+
+With `--ntfy` it talks to [ntfy.sh](https://ntfy.sh) (or your own server) and
+never touches our infrastructure at all.
+
+## What `init` does to your machine
+
+It is worth being explicit, because this edits a config file and installs
+something that runs on every turn:
+
+1. **Backs up** `~/.claude/settings.json` next to the original.
+2. **Merges** hooks into it — it adds to the existing arrays and never replaces
+   hooks from other tools. Malformed JSON is refused, not rewritten.
+3. Copies the runtime to `~/.config/agentbuzz/hook.mjs` and points the hooks at
+   `node ~/.config/agentbuzz/hook.mjs`. Vendoring one file is deliberate: it
+   keeps working after npx's temp directory is gone, needs nothing on `PATH`,
+   and pays no npx latency per turn.
+4. Stores config, including a delivery credential, in `~/.config/agentbuzz/`.
+
+`npx agentbuzz uninstall` removes only our hooks and leaves every other tool's
+alone.
+
+Hooks are read once at session start, so **restart Claude Code** after
+installing or nothing happens.
+
+## Commands
+
+| | |
+|---|---|
+| `init` | Detect Claude Code, back up and merge hooks, pair, send a test |
+| `test` | Send a notification that looks like a real one |
+| `status` | What the hook has been doing — and why it has been quiet |
+| `config` | Print config, or `--threshold <seconds>` to change it |
+| `uninstall` | Remove only our hooks |
+
+Flags for `init`: `--ntfy` (deliver via ntfy instead of the app), `--topic <name>`,
+`--threshold <sec>`, `--server <url>`, `--yes`.
 
 ## Quiet by default
 
-`Stop` fires every time the agent finishes responding, which in normal
-back-and-forth is a notification every twenty seconds. Turns shorter than the
-threshold (default **90s**) stay silent, and identical notifications inside 60s
-are deduplicated.
+`Stop` fires every time the agent finishes responding — in normal back-and-forth
+that is a notification every twenty seconds. Turns shorter than the threshold
+(90s by default) stay silent, and identical notifications inside 60s are
+deduplicated.
 
-If it has been quiet, `agentbuzz status` tells you whether that was on purpose:
+Silence is therefore ambiguous, so `status` disambiguates it:
 
 ```
 Listening · last run 6m ago (checkout, 43s, suppressed-short)
@@ -48,37 +87,40 @@ turn duration: median 43s · p90 105s · max 1850s
 
 Silence with a log line is working. Silence with no log line is broken.
 
-## Design rules
-
-Three, and they are not negotiable:
+## Three rules
 
 1. **Always exit 0.** A failed notification must never fail your run.
-2. **Hard timeout on every network call.** A hook must never hang a session.
-   Hooks are also registered `async`, so a notification costs you no latency.
+2. **Hard timeout on every network call.** Hooks are also registered `async`, so
+   a notification costs you no latency. If the API is down, your agent does not
+   notice.
 3. **Nothing but the summary line leaves the machine.**
 
-## How it installs
+## Development
 
-`init` backs up `~/.claude/settings.json`, then **merges** — it adds to the
-existing hook arrays rather than replacing them, so hooks from other tools
-survive. Malformed JSON is refused rather than rewritten.
+Zero dependencies, Node ≥18.17.
 
-The runtime is copied to `~/.config/agentbuzz/hook.mjs` and the hook command
-is `node ~/.config/agentbuzz/hook.mjs`. That is deliberate: it keeps working
-after npx's temp directory is gone, needs nothing on `PATH`, and pays no npx
-latency per turn.
+```bash
+node test/run.mjs          # 36 assertions, no install step
+```
 
-Hooks are snapshotted at session start, so **restart Claude Code** after
-installing or nothing happens.
+There is no `npm install` — the absence of a dependency tree is a feature for
+something that reads your transcripts, and CI never installs anything so it
+stays that way.
 
-## Events
+```bash
+node scripts/grade-summaries.mjs 20
+```
 
-`UserPromptSubmit` (stamps turn start, sends nothing), `Stop`, `StopFailure`,
-`Notification`, `PermissionRequest`.
+prints the notification that *would* be sent for the last turn of your 20 most
+recent transcripts, and sends nothing. That is how summary quality is judged:
+by reading real output, not by reasoning about it.
 
-`PermissionRequest` is the valuable one — a frozen agent waiting on you costs
-more than a finished one. Its ping carries the actual request rather than a
-generic summary.
+Inspect a single event without sending it:
+
+```bash
+echo '{"hook_event_name":"Stop","session_id":"x","cwd":"'$PWD'"}' \
+  | npx agentbuzz hook --dry-run
+```
 
 ## Config
 
@@ -95,15 +137,8 @@ generic summary.
 
 > **ntfy.sh topics are unauthenticated.** Anyone who knows the topic name can
 > read your notifications. The long random name is the only protection — do not
-> shorten it. Point `base` at your own ntfy server if that is not good enough.
+> shorten it. Point `base` at your own server if that is not good enough.
 
-## Inspecting it
+## Licence
 
-```bash
-echo '{"hook_event_name":"Stop","session_id":"x","cwd":"'$PWD'"}' \
-  | npx agentbuzz hook --dry-run
-```
-
-Prints exactly what would be sent, and sends nothing.
-
-MIT.
+MIT. See [LICENSE](LICENSE).

@@ -13,7 +13,11 @@
   ],
   "homepage": "https://agentnotify.web.app",
   "bugs": {
-    "url": "https://agentnotify.web.app/support"
+    "url": "https://github.com/ourimo/agentbuzz/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ourimo/agentbuzz.git"
   },
   "license": "MIT",
   "author": "Aurimas Paliukaitis",

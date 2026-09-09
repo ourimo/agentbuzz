@@ -1,0 +1,31 @@
+name: Bug report
+description: Something is not working
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: run `npx agentbuzz status`. It reports whether the hook
+        is firing at all, and whether notifications were suppressed on purpose
+        (short turns stay quiet by design).
+  - type: textarea
+    id: status
+    attributes:
+      label: Output of `npx agentbuzz status`
+      render: text
+    validations: { required: true }
+  - type: input
+    id: versions
+    attributes:
+      label: agentbuzz version, Node version, OS
+      placeholder: "1.0.0, node 22.3.0, macOS 15.5"
+    validations: { required: true }
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+    validations: { required: true }
+  - type: markdown
+    attributes:
+      value: |
+        **Do not paste notification bodies containing anything private** — they
+        are one-line summaries of your work.
