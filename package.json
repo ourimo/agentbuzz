@@ -1,6 +1,6 @@
 {
   "name": "agentbuzz",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Know the second your agent needs you \u2014 Claude Code notifications on your phone and Apple Watch, and answer them from your wrist.",
   "keywords": [
     "claude-code",
