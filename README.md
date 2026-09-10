@@ -26,7 +26,7 @@ read locally to build a one-line summary, and only that summary is sent:
 
 ```json
 { "project": "checkout", "status": "blocked",
-  "title": "wants permission to use Bash", "body": "npm run migrate:prod",
+  "title": "checkout — permission", "body": "wants permission to run: npm run migrate:prod",
   "duration": 372 }
 ```
 
@@ -34,6 +34,13 @@ No file contents, no diffs, no prompts, no tool output. This is not a policy —
 it is the only architecture that works, and it is why enrichment is a local
 script rather than a server. Read [`runtime/hook.mjs`](runtime/hook.mjs) and
 check.
+
+One deliberate exception, visible above: **a blocked ping carries the command
+it is blocked on**. It has to — `wants permission to use: Bash` is the same
+sentence whether the agent wants to list a directory or drop the production
+database, and the only way to act on it would be to walk back to the machine.
+File paths in that line are reduced to a basename, so it says *which* file
+without publishing the shape of your disk.
 
 With `--ntfy` it talks to [ntfy.sh](https://ntfy.sh) (or your own server) and
 never touches our infrastructure at all. With `--macos` nothing leaves the

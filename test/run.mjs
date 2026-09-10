@@ -9,7 +9,7 @@ import {
   demarkdown, trimToSentence, leadParagraph, isPreamble,
   classify, humanDuration, enrich, buildNote, DEFAULTS,
   normalizeConfig, macArgs, deliver, adapters,
-  AGENTS, KINDS, normalizePayload, capturedSummary, agentFromArgv
+  AGENTS, KINDS, normalizePayload, capturedSummary, agentFromArgv, describeRequest
 } from '../runtime/hook.mjs';
 
 let pass = 0, fail = 0;
@@ -233,6 +233,46 @@ const cursorNote = buildNote(
   DEFAULTS, 95, { agent: 'cursor', captured: 'Both changes are in and verified.' });
 eq('cursor summary is the captured text', cursorNote.summary, 'Both changes are in and verified.');
 eq('cursor body', cursorNote.body, 'Both changes are in and verified.\n— 1m 35s');
+
+/* ── what a blocked run is blocked ON ───────────────────────────────────── */
+// The whole value of the highest-value ping: a decision you can make from a
+// lock screen, rather than the same sentence for every tool.
+eq('a bash command is the request',
+   describeRequest('Bash', { command: 'npm run migrate:prod' }), 'run: npm run migrate:prod');
+// Codex's shell passes argv rather than a string.
+eq('argv is joined',
+   describeRequest('shell', { command: ['rm', '-rf', 'build/'] }), 'run: rm -rf build/');
+eq('newlines in a command are flattened',
+   describeRequest('Bash', { command: 'npm test \\\n  --watch' }), 'run: npm test \\ --watch');
+// A path says WHICH file without publishing the shape of someone's disk.
+eq('a file path is reduced to its basename',
+   describeRequest('Edit', { file_path: '/Users/ap/src/api/webhook.ts' }), 'use: Edit (webhook.ts)');
+eq('notebooks too',
+   describeRequest('NotebookEdit', { notebook_path: '/x/a.ipynb' }), 'use: NotebookEdit (a.ipynb)');
+eq('a url is kept whole',
+   describeRequest('WebFetch', { url: 'https://example.com/x' }), 'use: WebFetch (https://example.com/x)');
+// The old behaviour, for a payload carrying no input at all.
+eq('no input falls back to the tool name', describeRequest('Bash', null), 'use: Bash');
+eq('no tool either', describeRequest('', {}), 'use: a tool');
+// A command is not prose: cutting it at a sentence boundary would make it a
+// DIFFERENT command, so it is clipped hard and marked.
+const longCmd = describeRequest('Bash', { command: 'x'.repeat(300) });
+ok_('a long command is clipped', longCmd.length < 160 && longCmd.endsWith('…'));
+
+// End to end, in the note the phone actually receives.
+const permNote = buildNote({
+  hook_event_name: 'PermissionRequest', cwd: '/x/checkout',
+  tool_name: 'Bash', tool_input: { command: 'npm run migrate:prod' }
+}, DEFAULTS, 372);
+eq('the blocked ping carries the command',
+   permNote.body, 'wants permission to run: npm run migrate:prod');
+eq('and still has no stats', permNote.stats, '');
+// Codex reaches the same place through its own field names.
+eq('codex blocked ping carries it too',
+   buildNote({ hook_event_name: 'PermissionRequest', cwd: '/x/api',
+               tool_name: 'shell', tool_input: { command: ['psql', '-c', 'drop table users'] } },
+             DEFAULTS, 12, { agent: 'codex' }).body,
+   'wants permission to run: psql -c drop table users');
 
 /* ── which agent is on the other end of the pipe ────────────────────────── */
 eq('--agent is read', agentFromArgv(['node', 'hook.mjs', '--agent', 'codex']), 'codex');

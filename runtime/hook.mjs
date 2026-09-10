@@ -223,6 +223,7 @@ export const AGENTS = {
     cwd: (p) => p.cwd,
     session: (p) => p.session_id,
     tool: (p) => p.tool_name,
+    input: (p) => p.tool_input,
     message: (p) => p.message,
     /** The only transcript enrich() understands — it is Claude Code's schema. */
     transcript: (p) => p.transcript_path
@@ -239,6 +240,7 @@ export const AGENTS = {
     cwd: (p) => p.cwd,
     session: (p) => p.session_id,
     tool: (p) => p.tool_name,
+    input: (p) => p.tool_input,
     /**
      * Codex hands us the final message outright, so its summary costs no file
      * read at all. Its `transcript_path` is ignored ON PURPOSE: that file is a
@@ -290,6 +292,7 @@ export function normalizePayload(agentId, payload = {}) {
     project: basename(a.cwd?.(payload) || process.cwd()),
     session: a.session?.(payload) || 'unknown',
     tool: a.tool?.(payload) || '',
+    input: a.input?.(payload) ?? null,
     message: a.message?.(payload) || '',
     text: a.text?.(payload) || '',
     capture: a.capture?.(payload) || '',
@@ -533,6 +536,47 @@ export async function deliver(channels, note) {
 
 const asciiOnly = (s) => s.replace(/[^\x20-\x7E]/g, '').replace(/\s+/g, ' ').trim();
 
+/**
+ * What a blocked run is actually blocked ON.
+ *
+ * `wants permission to use: Bash` is true and nearly useless — it is the same
+ * sentence whether the agent wants to list a directory or drop the production
+ * database, so the only way to act on it is to walk back to the machine, which
+ * is the thing this product exists to avoid. `wants permission to run:
+ * npm run migrate:prod` is a decision you can make from a lock screen.
+ *
+ * The command has always been in the payload under `tool_input`; nothing read
+ * it. The relay contract in the README has advertised it since the first
+ * release — `"body": "npm run migrate:prod"` — so this closes a gap between the
+ * pitch and the build rather than widening what leaves the machine.
+ *
+ * File paths are reduced to a BASENAME on purpose. The point is to say which
+ * file, not to publish the shape of someone's disk, and `src/api/webhook.ts` is
+ * no more actionable on a watch than `webhook.ts`.
+ */
+export function describeRequest(tool, input) {
+  const name = String(tool || '').trim();
+  const i = input && typeof input === 'object' ? input : {};
+
+  // Claude Code's Bash passes a command string; Codex's shell passes argv.
+  const command = typeof i.command === 'string' ? i.command
+                : Array.isArray(i.command) ? i.command.filter((x) => typeof x === 'string').join(' ')
+                : '';
+  if (command.trim()) return `run: ${clip(command.trim().replace(/\s+/g, ' '), 140)}`;
+
+  const path = [i.file_path, i.notebook_path, i.path].find((x) => typeof x === 'string' && x);
+  if (path) return `use: ${name || 'a tool'} (${basename(path)})`;
+
+  const url = typeof i.url === 'string' && i.url ? i.url : '';
+  if (url) return `use: ${name || 'a tool'} (${clip(url, 80)})`;
+
+  return `use: ${name || 'a tool'}`;
+}
+
+/** Hard truncation, for text that is not prose — a command cut at a sentence
+ *  boundary would be a different command. */
+const clip = (s, max) => (s.length <= max ? s : s.slice(0, max - 1).trimEnd() + '…');
+
 /* ── building the notification ──────────────────────────────────────────── */
 
 export function buildNote(payload, cfg, elapsed, { agent = 'claude', captured = '' } = {}) {
@@ -544,7 +588,7 @@ export function buildNote(payload, cfg, elapsed, { agent = 'claude', captured = 
   // summary is actively useless there: "wants permission to run rm -rf build/"
   // is the whole value of a blocked ping.
   if (n.kind === 'permission') {
-    summary = `wants permission to use: ${n.tool || 'a tool'}`;
+    summary = `wants permission to ${describeRequest(n.tool, n.input)}`;
   } else if (n.kind === 'blocked' && n.message) {
     summary = demarkdown(n.message).slice(0, 180);
   }
