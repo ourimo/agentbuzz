@@ -3,9 +3,12 @@
 import { writeFileSync, mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { execFileSync } from 'node:child_process';
+import { platform } from 'node:os';
 import {
   demarkdown, trimToSentence, leadParagraph, isPreamble,
-  classify, humanDuration, enrich, buildNote, DEFAULTS
+  classify, humanDuration, enrich, buildNote, DEFAULTS,
+  normalizeConfig, macArgs, deliver, adapters
 } from '../runtime/hook.mjs';
 
 let pass = 0, fail = 0;
@@ -107,6 +110,63 @@ const done = buildNote(
   { hook_event_name: 'Stop', cwd: '/x/checkout', transcript_path: t }, DEFAULTS, 412);
 eq('done title', done.title, 'checkout — done');
 eq('done body', done.body, 'Build is green and npm test passes.\n— 2 files changed · 2× Edit, 1× Write · 6m 52s');
+// The stat line also stands alone, for the macOS banner's subtitle slot.
+eq('done stats', done.stats, '2 files changed · 2× Edit, 1× Write · 6m 52s');
+eq('a blocked ping has no stats', blocked.stats, '');
+
+/* ── config migration ───────────────────────────────────────────────────── */
+// v1 wrote a single `channel`. An old config on disk must keep delivering.
+const migrated = normalizeConfig({ channel: { type: 'ntfy', topic: 'abc' } });
+eq('v1 channel becomes a list', migrated.channels.length, 1);
+eq('v1 channel is preserved', migrated.channels[0].topic, 'abc');
+ok_('v1 key is dropped', !('channel' in migrated));
+eq('a v2 list survives untouched',
+   normalizeConfig({ channels: [{ type: 'relay' }, { type: 'macos' }] }).channels.length, 2);
+// Both keys present: the list wins, or a re-init would resurrect a stale channel.
+eq('the list wins over a stale channel',
+   normalizeConfig({ channel: { type: 'ntfy' }, channels: [{ type: 'macos' }] }).channels[0].type, 'macos');
+eq('empty config yields no channels', normalizeConfig({}).channels.length, 0);
+
+/* ── the macOS banner: argv, never interpolation ────────────────────────── */
+const hostile = 'he said "rm -rf /" \\ then ) stopped';
+const mac = macArgs({ summary: hostile, title: 'proj — done', stats: '2 files · 4s', status: 'done' });
+const script = mac.filter((a, i) => mac[i - 1] === '-e').join('\n');
+ok_('the summary never enters the script text', !script.includes(hostile));
+ok_('the script reads its text from argv', /item 1 of argv/.test(script));
+// Without `--`, a summary starting with "-" is parsed as an option and the
+// script dies with "the run handler is specified more than once".
+ok_('arguments are separated by --', mac.includes('--'));
+eq('argv order is body, title, subtitle', mac.slice(mac.indexOf('--') + 1).join('|'),
+   `${hostile}|proj — done|2 files · 4s`);
+ok_('a finished run is silent', !/sound name/.test(script));
+ok_('a blocked run makes a sound',
+    /sound name/.test(macArgs({ status: 'blocked', summary: 'x', title: 'y', stats: '' }).join(' ')));
+
+// The real thing, on a real osascript — same argv, harmless statement, no banner.
+if (platform() === 'darwin') {
+  const probe = mac.map((a) => (a.startsWith('display notification') ? 'return item 1 of argv' : a));
+  let out = '';
+  try { out = execFileSync('osascript', probe, { encoding: 'utf8' }).trim(); } catch (e) { out = `threw: ${e.message}`; }
+  eq('osascript returns the summary verbatim', out, hostile);
+}
+
+/* ── delivery fan-out ───────────────────────────────────────────────────── */
+adapters.stub = async () => ({ ok: true, detail: 'ok' });
+adapters.boom = async () => { throw new Error('adapter exploded'); };
+
+eq('no channels is not a delivery', (await deliver([], {})).ok, false);
+eq('an unknown channel fails', (await deliver([{ type: 'nope' }], {})).ok, false);
+// ok means "the user was notified", not "everything worked" — there is no retry
+// anywhere, so one live channel is the whole success condition.
+eq('one live channel is enough', (await deliver([{ type: 'stub' }, { type: 'nope' }], {})).ok, true);
+ok_('the failure is still reported',
+    /nope: unknown channel/.test((await deliver([{ type: 'stub' }, { type: 'nope' }], {})).detail));
+// Rule 1: a throwing adapter may never reach the hook's caller.
+eq('a throwing adapter is contained', (await deliver([{ type: 'boom' }], {})).ok, false);
+eq('a throwing adapter does not stop the others',
+   (await deliver([{ type: 'boom' }, { type: 'stub' }], {})).ok, true);
+eq('a bare channel object still delivers', (await deliver({ type: 'stub' }, {})).ok, true);
+eq('one result per channel', (await deliver([{ type: 'stub' }, { type: 'stub' }], {})).results.length, 2);
 
 console.log(`\n${fail ? '✗' : '✓'} ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

@@ -33,7 +33,43 @@ script rather than a server. Read [`runtime/hook.mjs`](runtime/hook.mjs) and
 check.
 
 With `--ntfy` it talks to [ntfy.sh](https://ntfy.sh) (or your own server) and
-never touches our infrastructure at all.
+never touches our infrastructure at all. With `--macos` nothing leaves the
+machine at all — see below.
+
+## Channels
+
+You can have more than one, and every configured channel gets every
+notification. They are delivered in parallel, so a slow one never holds up a
+fast one.
+
+| | |
+|---|---|
+| `relay` | The default. Push to the iPhone and Apple Watch app; the only channel that can approve a permission request. |
+| `ntfy` | [ntfy.sh](https://ntfy.sh) or your own server. No account with us. |
+| `macos` | A banner on the Mac the agent is running on. No account, no network, works offline. |
+
+The combination worth having is **`relay` + `macos`**: a banner while you are at
+the desk, a buzz on your wrist once you are not.
+
+### The Mac banner
+
+```bash
+npx agentbuzz init --macos          # banner only — no account, nothing to pair
+npx agentbuzz config --macos on     # add it to a phone you already paired
+npx agentbuzz config --macos off
+```
+
+Two limits, both structural:
+
+- **It is ping-only.** Allow / Deny buttons need an app that registered a
+  notification category with macOS, which a script cannot do. Approving a
+  permission request stays on the phone and the Watch.
+- **The banner says "Script Editor".** It is posted through `osascript`, which
+  has no bundle identity of its own, so macOS attributes it to Script Editor —
+  and if Script Editor's notifications are switched off, delivery reports
+  success and nothing appears. **System Settings → Notifications → Script
+  Editor → Allow.** The alternative is a dependency on `terminal-notifier`,
+  which is worth less than the zero-dependency guarantee.
 
 ## What `init` does to your machine
 
@@ -62,11 +98,16 @@ installing or nothing happens.
 | `init` | Detect Claude Code, back up and merge hooks, pair, send a test |
 | `test` | Send a notification that looks like a real one |
 | `status` | What the hook has been doing — and why it has been quiet |
-| `config` | Print config, or `--threshold <seconds>` to change it |
+| `config` | Print config, or `--threshold <sec>` / `--macos on\|off` to change it |
 | `uninstall` | Remove only our hooks |
 
-Flags for `init`: `--ntfy` (deliver via ntfy instead of the app), `--topic <name>`,
-`--threshold <sec>`, `--server <url>`, `--yes`.
+Flags for `init`: `--ntfy` (deliver via ntfy instead of the app), `--macos`
+(banner on this Mac — on its own, no account is needed), `--no-macos`,
+`--topic <name>`, `--threshold <sec>`, `--server <url>`, `--yes`.
+
+`test` exits non-zero if **any** channel failed. The hook is deliberately more
+forgiving at runtime: one channel that delivered means you were notified, and
+nothing here ever retries.
 
 ## Quiet by default
 
@@ -131,9 +172,15 @@ echo '{"hook_event_name":"Stop","session_id":"x","cwd":"'$PWD'"}' \
   "threshold": 90,
   "dedupe": 60,
   "tail": 500,
-  "channel": { "type": "ntfy", "base": "https://ntfy.sh", "topic": "agentbuzz-…" }
+  "channels": [
+    { "type": "relay", "endpoint": "https://…/v1/ingest", "key": "…" },
+    { "type": "macos" }
+  ]
 }
 ```
+
+Configs written before multi-channel stored a single `channel` object. Those
+are migrated on read, so an old install keeps working untouched.
 
 > **ntfy.sh topics are unauthenticated.** Anyone who knows the topic name can
 > read your notifications. The long random name is the only protection — do not

@@ -20,6 +20,7 @@
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, existsSync, readdirSync, unlinkSync, statSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { homedir } from 'node:os';
+import { execFile } from 'node:child_process';
 
 export const CONFIG_DIR = process.env.AGENTBUZZ_HOME || join(homedir(), '.config', 'agentbuzz');
 export const CONFIG_FILE = join(CONFIG_DIR, 'config.json');
@@ -31,16 +32,30 @@ export const DEFAULTS = {
   threshold: 90,   // seconds; a Stop below this stays quiet
   dedupe: 60,      // seconds; identical title+body suppressed within this window
   tail: 500,       // transcript lines to scan — bounds the work on huge sessions
-  channel: null    // { type: "ntfy", base, topic }
+  channels: []     // [{ type: "relay", … }, { type: "macos" }] — all delivered to
 };
 
 /* ── config ─────────────────────────────────────────────────────────────── */
 
+/**
+ * v1 configs stored ONE channel, as `channel`. Migration happens on read rather
+ * than on write, so a config written by an older version keeps delivering even
+ * if nothing ever calls `saveConfig` on this machine again.
+ */
+export function normalizeConfig(raw) {
+  const cfg = { ...DEFAULTS, ...raw };
+  const list = (Array.isArray(cfg.channels) ? cfg.channels : []).filter(Boolean);
+  if (!list.length && cfg.channel) list.push(cfg.channel);
+  delete cfg.channel;
+  cfg.channels = list;
+  return cfg;
+}
+
 export function loadConfig() {
   try {
-    return { ...DEFAULTS, ...JSON.parse(readFileSync(CONFIG_FILE, 'utf8')) };
+    return normalizeConfig(JSON.parse(readFileSync(CONFIG_FILE, 'utf8')));
   } catch {
-    return { ...DEFAULTS };
+    return normalizeConfig({});
   }
 }
 
@@ -257,13 +272,12 @@ export function enrich(transcriptPath, tailLines) {
 /* ── delivery ───────────────────────────────────────────────────────────── */
 
 /**
- * Delivery adapters all take the same shape, so adding the hosted relay or
- * Telegram later is a new branch here and nothing else.
+ * One adapter per channel type, all the same shape: (channel, note) →
+ * {ok, detail}. Adding a channel is a new entry here and nothing else.
+ * Exported so a test can register a stub without going near the network.
  */
-export async function deliver(channel, note) {
-  if (!channel) return { ok: false, detail: 'no channel configured' };
-
-  if (channel.type === 'ntfy') {
+export const adapters = {
+  async ntfy(channel, note) {
     const base = channel.base || 'https://ntfy.sh';
     // ntfy drops non-ASCII header values, so the title goes out ASCII-only and
     // anything expressive lives in the body.
@@ -278,9 +292,9 @@ export async function deliver(channel, note) {
       signal: AbortSignal.timeout(5000)
     });
     return { ok: res.status === 200, detail: `http ${res.status}` };
-  }
+  },
 
-  if (channel.type === 'relay') {
+  async relay(channel, note) {
     const res = await fetch(channel.endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${channel.key}` },
@@ -292,9 +306,93 @@ export async function deliver(channel, note) {
       signal: AbortSignal.timeout(5000)
     });
     return { ok: res.ok, detail: `http ${res.status}` };
-  }
+  },
 
-  return { ok: false, detail: `unknown channel ${channel.type}` };
+  /**
+   * A banner on this Mac. The agent is running here, so this channel needs no
+   * relay, no account and no network — it is the only one that still works on a
+   * plane, and the only one that costs nothing to try before pairing a phone.
+   *
+   * It is deliberately ping-only: action buttons require an app that registered
+   * a UNNotificationCategory, which an unbundled script cannot do. Allow/Deny
+   * stays on the phone and the Watch.
+   */
+  async macos(_channel, note) {
+    if (process.platform !== 'darwin') return { ok: false, detail: `not macOS (${process.platform})` };
+    return await osascript(macArgs(note));
+  }
+};
+
+/**
+ * The AppleScript for one banner.
+ *
+ * Two things here are load-bearing:
+ *
+ *   1. **The text is passed as `argv`, never interpolated into the script.**
+ *      Summaries are written by an agent and contain quotes, backslashes and
+ *      newlines; AppleScript string escaping is its own dialect, and getting it
+ *      wrong is arbitrary code execution with whatever the agent last said.
+ *   2. **`--` before the arguments.** Verified against osascript: it is
+ *      consumed rather than passed through, and without it a summary or a
+ *      project name starting with `-` is parsed as an option — the script then
+ *      dies with "the run handler is specified more than once".
+ *
+ * Sound names are literals from /System/Library/Sounds — never user data — so
+ * they are the one thing safe to bake into the script text.
+ */
+export function macArgs(note) {
+  const sound = note.status === 'done' ? '' : ' sound name "Ping"';
+  return [
+    '-e', 'on run argv',
+    '-e', `display notification (item 1 of argv) with title (item 2 of argv) subtitle (item 3 of argv)${sound}`,
+    '-e', 'end run',
+    '--', note.summary || '', note.title || '', note.stats || ''
+  ];
+}
+
+/** Never rejects: rule 1 says a notification may not fail the user's run. */
+function osascript(args) {
+  return new Promise((resolve) => {
+    execFile('osascript', args, { timeout: 5000 }, (err, _stdout, stderr) => {
+      if (!err) return resolve({ ok: true, detail: 'ok' });
+      const why = err.killed ? 'timed out' : (String(stderr).trim().split('\n')[0] || err.message);
+      resolve({ ok: false, detail: why.slice(0, 120) });
+    });
+  });
+}
+
+export async function deliverTo(channel, note) {
+  const adapter = adapters[channel?.type];
+  if (!adapter) return { ok: false, detail: `unknown channel ${channel?.type}` };
+  return await adapter(channel, note);
+}
+
+/**
+ * Fan out to every configured channel at once. Serial delivery would put the
+ * relay's round-trip in front of a local banner that costs nothing — and the
+ * banner is the one the user is already looking at.
+ *
+ * `ok` is true if ANY channel delivered: the user was notified. Nothing in this
+ * system retries — the next hook event builds a new note — so a partial failure
+ * is worth logging and nothing more.
+ *
+ * A bare channel object is accepted as well as a list, so a v1 config that
+ * reached this function unnormalised still delivers.
+ */
+export async function deliver(channels, note) {
+  const list = Array.isArray(channels) ? channels.filter(Boolean) : (channels ? [channels] : []);
+  if (!list.length) return { ok: false, detail: 'no channel configured', results: [] };
+
+  const results = await Promise.all(list.map(async (ch) => {
+    try { return { type: ch?.type, ...(await deliverTo(ch, note)) }; }
+    catch (e) { return { type: ch?.type, ok: false, detail: String(e?.message || e).slice(0, 120) }; }
+  }));
+
+  return {
+    ok: results.some((r) => r.ok),
+    detail: results.map((r) => `${r.type}: ${r.detail}`).join(' · '),
+    results
+  };
 }
 
 const asciiOnly = (s) => s.replace(/[^\x20-\x7E]/g, '').replace(/\s+/g, ' ').trim();
@@ -321,12 +419,18 @@ export function buildNote(payload, cfg, elapsed) {
   const changed = files ? `${files} file${files === 1 ? '' : 's'} changed · ` : '';
 
   const blocked = status === 'blocked';
+  // The stat line is carried separately as well as folded into `body`: a macOS
+  // banner has a real subtitle slot for it, and appending it to the summary
+  // there reads as one run-on sentence. A blocked ping has no stats — what it
+  // is blocked on is the whole message.
+  const stats = blocked ? '' : `${changed}${tools} · ${humanDuration(elapsed)}`;
+
   return {
     event, project, status, elapsed,
     rawTitle: `${project} — ${suffix}`,
     title: `${project} — ${suffix}`,
-    summary,
-    body: blocked ? summary : `${summary}\n— ${changed}${tools} · ${humanDuration(elapsed)}`,
+    summary, stats,
+    body: blocked ? summary : `${summary}\n— ${stats}`,
     prio, tags
   };
 }
@@ -397,7 +501,7 @@ export async function runHook(payload, { dryRun = false } = {}) {
     return { action: 'suppressed-short', elapsed };
   }
 
-  if (!cfg.channel && !dryRun) {
+  if (!cfg.channels.length && !dryRun) {
     logline(event, project, elapsed, 'error', 'no channel configured');
     return { action: 'error', detail: 'no channel configured' };
   }
@@ -412,9 +516,12 @@ export async function runHook(payload, { dryRun = false } = {}) {
   }
 
   try {
-    const { ok, detail } = await deliver(cfg.channel, note);
+    const { ok, detail } = await deliver(cfg.channels, note);
     if (ok) recordSent(note, now);
-    logline(event, project, elapsed, ok ? 'sent' : 'error', ok ? '' : detail);
+    // Detail is logged on success too, now that there can be more than one
+    // channel: "relay: http 200 · macos: timed out" is the only place a partial
+    // failure is ever visible.
+    logline(event, project, elapsed, ok ? 'sent' : 'error', detail);
     return { action: ok ? 'sent' : 'error', detail, note };
   } catch (err) {
     // Timeouts land here. The run continues regardless — that is the point.

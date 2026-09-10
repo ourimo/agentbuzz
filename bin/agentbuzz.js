@@ -46,6 +46,18 @@ const info = (s) => console.log(`  ${dim('·')} ${s}`);
 const warn = (s) => console.log(`  ${amber('!')} ${s}`);
 const err = (s) => console.log(`  ${red('✗')} ${s}`);
 
+/** An unbundled script has no identity of its own, so the banner arrives as
+ *  Script Editor — and if that is muted, delivery "succeeds" and nothing
+ *  appears. Say it before it is asked. */
+const MAC_PERMISSION_HINT =
+  'No banner? System Settings → Notifications → Script Editor → Allow. macOS attributes it there.';
+
+const describeChannel = (ch) =>
+  ch.type === 'ntfy'  ? `ntfy · ${ch.topic}`
+: ch.type === 'relay' ? `relay · ${ch.endpoint}`
+: ch.type === 'macos' ? 'macos · banner on this Mac'
+: ch.type;
+
 const args = process.argv.slice(2);
 const flag = (name) => args.includes(`--${name}`);
 const opt = (name, fallback = null) => {
@@ -157,25 +169,48 @@ async function cmdInit() {
 
   if (!(await confirm('Configure it for notifications?'))) { info('Nothing changed.'); return; }
 
-  // 2. Channel.
+  // 2. Channels.
   const cfg = loadConfig();
   cfg.threshold = Number(opt('threshold', cfg.threshold ?? DEFAULTS.threshold));
 
-  // The hosted relay is the default — it is the product, and it is what
+  // The REMOTE channel is the one that reaches you after you have walked away,
+  // and it is the product. The hosted relay is its default — it is what
   // delivers to the app and the Watch. `--ntfy` is the escape hatch for people
   // who would rather not route anything through us.
-  const useRelay = !flag('ntfy') && cfg.channel?.type !== 'ntfy' || flag('relay');
-  if (useRelay) {
+  //
+  // `--macos` on its own is the third path: nothing leaves this machine, so
+  // there is no account and nothing to pair. It exists so the tool is useful
+  // in the thirty seconds before anyone has installed an app.
+  const previous = cfg.channels.find((ch) => ch.type === 'relay' || ch.type === 'ntfy');
+  const remote = flag('ntfy')  ? 'ntfy'
+               : flag('relay') ? 'relay'
+               : (flag('macos') && !previous) ? null
+               : previous?.type ?? 'relay';
+
+  const channels = [];
+  if (remote === 'relay') {
     const paired = await pairWithPhone();
     if (!paired) { err('Pairing did not complete — nothing was changed.'); process.exitCode = 1; return; }
-    cfg.channel = { type: 'relay', endpoint: `${API}/v1/ingest`, key: paired.apiKey };
-  } else {
+    channels.push({ type: 'relay', endpoint: `${API}/v1/ingest`, key: paired.apiKey });
+  } else if (remote === 'ntfy') {
     // A long random ntfy topic is the ONLY thing protecting it: ntfy.sh topics
     // are unauthenticated, and anyone who guesses the name reads one-line
     // summaries of what you are building.
-    const topic = opt('topic') || cfg.channel?.topic || `agentbuzz-${randomBytes(9).toString('hex')}`;
-    cfg.channel = { type: 'ntfy', base: opt('server', 'https://ntfy.sh'), topic };
+    const topic = opt('topic') || previous?.topic || `agentbuzz-${randomBytes(9).toString('hex')}`;
+    channels.push({ type: 'ntfy', base: opt('server', 'https://ntfy.sh'), topic });
   }
+
+  // The Mac banner is an ADDITION to the remote channel, never a replacement:
+  // a banner on the machine you walked away from is not a notification. Asked
+  // about rather than assumed, because plenty of people are staring at the
+  // window the agent is running in and want nothing from it.
+  const wantsMac = process.platform === 'darwin' && !flag('no-macos') && (
+    flag('macos') ||
+    cfg.channels.some((ch) => ch.type === 'macos') ||
+    await confirm('Also show a banner on this Mac?')
+  );
+  if (wantsMac) channels.push({ type: 'macos' });
+  cfg.channels = channels;
 
   // 3. Back up, then merge.
   const bak = backup(CLAUDE_SETTINGS);
@@ -193,15 +228,18 @@ async function cmdInit() {
   ok(`Installed  ${dim(RUNTIME_DST.replace(homedir(), '~'))}`);
 
   // 5. Confirm delivery in both directions.
-  if (cfg.channel.type === 'ntfy') {
+  const ntfy = cfg.channels.find((ch) => ch.type === 'ntfy');
+  if (ntfy) {
     console.log(`\n  Subscribe to this topic in the ${bold('ntfy')} app:\n`);
-    console.log(`      ${bold(cfg.channel.topic)}`);
-    console.log(`      ${dim(`${cfg.channel.base}/${cfg.channel.topic}`)}\n`);
+    console.log(`      ${bold(ntfy.topic)}`);
+    console.log(`      ${dim(`${ntfy.base}/${ntfy.topic}`)}\n`);
     info('iOS: set ntfy to Time Sensitive in Settings → Notifications, so blocked-agent');
     info('pings pierce Focus. Your Watch mirrors them automatically.');
   }
-
+  // The hint belongs with the first banner. `test` prints it too, so only say
+  // it here when no test is being sent.
   if (await confirm('\n  Send a test notification now?')) await sendTest(cfg);
+  else if (wantsMac) info(dim(MAC_PERMISSION_HINT));
 
   // 6. Say the restart line out loud. Hooks are snapshotted at session start;
   //    skipping this makes users conclude it is broken within 60 seconds.
@@ -262,19 +300,31 @@ async function pairWithPhone() {
 /** A test notification must look like a REAL one. "Test notification" proves
  *  the pipe works but demonstrates nothing; the enrichment is the pitch. */
 async function sendTest(cfg = loadConfig()) {
-  if (!cfg.channel) { err('No channel configured. Run: agentbuzz init'); process.exitCode = 1; return; }
+  if (!cfg.channels.length) { err('No channel configured. Run: agentbuzz init'); process.exitCode = 1; return; }
+  const stats = '12× Read, 4× Edit, 1× Bash · 1m 12s';
   const note = {
     project: 'agentbuzz', status: 'done',
     title: 'agentbuzz — done', rawTitle: 'agentbuzz — done',
     summary: 'Setup complete. This is what a finished run looks like.',
-    body: 'Setup complete. This is what a finished run looks like.\n— 12× Read, 4× Edit, 1× Bash · 1m 12s',
+    stats,
+    body: `Setup complete. This is what a finished run looks like.\n— ${stats}`,
     prio: 'default', tags: 'white_check_mark', elapsed: 72
   };
   const t0 = Date.now();
   try {
-    const res = await deliver(cfg.channel, note);
-    if (res.ok) ok(`Test notification delivered in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
-    else { err(`Delivery failed — ${res.detail}`); process.exitCode = 1; }
+    // Reported per channel: "it worked" is the wrong answer when the banner
+    // fired and the phone did not.
+    const res = await deliver(cfg.channels, note);
+    for (const r of res.results) {
+      if (r.ok) ok(`Delivered via ${bold(r.type)}`);
+      else err(`${r.type} — ${r.detail}`);
+    }
+    if (res.ok) info(dim(`${((Date.now() - t0) / 1000).toFixed(1)}s`));
+    if (res.results.some((r) => r.type === 'macos' && r.ok)) info(dim(MAC_PERMISSION_HINT));
+    // Stricter than the hook, deliberately. At runtime one live channel means
+    // the user was notified and there is nothing to do; `test` is a diagnostic,
+    // and a dead channel is exactly the thing it was run to find.
+    if (res.results.some((r) => !r.ok)) process.exitCode = 1;
   } catch (e) {
     err(`Delivery failed — ${e.message}`);
     process.exitCode = 1;
@@ -307,10 +357,12 @@ function cmdStatus() {
   const log = readLog();
   console.log(`\n${bold('agentbuzz')} ${dim('· status')}\n`);
 
-  if (!cfg.channel) { warn('No channel configured. Run: agentbuzz init'); return; }
-  info(`Channel    ${cfg.channel.type} · ${cfg.channel.topic ?? cfg.channel.endpoint}`);
+  if (!cfg.channels.length) { warn('No channel configured. Run: agentbuzz init'); return; }
+  cfg.channels.forEach((ch, i) => info(`${i ? '         ' : 'Channels '}  ${describeChannel(ch)}`));
   info(`Threshold  ${cfg.threshold}s`);
-  const installed = existsSync(RUNTIME_DST) && /agent-?notify/.test(
+  // isOurs, not a literal — the hook path is ~/.config/agentbuzz, which the old
+  // /agent-?notify/ pattern never matched, so this always read NOT installed.
+  const installed = existsSync(RUNTIME_DST) && isOurs(
     existsSync(CLAUDE_SETTINGS) ? readFileSync(CLAUDE_SETTINGS, 'utf8') : ''
   );
   info(`Hooks      ${installed ? green('installed') : red('NOT installed')}`);
@@ -350,8 +402,33 @@ function cmdStatus() {
 
 function cmdConfig() {
   const cfg = loadConfig();
+  let changed = false;
+
   const t = opt('threshold');
-  if (t !== null) { cfg.threshold = Number(t); saveConfig(cfg); ok(`Threshold set to ${cfg.threshold}s`); return; }
+  if (t !== null) { cfg.threshold = Number(t); changed = true; ok(`Threshold set to ${cfg.threshold}s`); }
+
+  // Turning the banner on must not cost a re-pair: the phone's key already
+  // lives in this config, and `init` would issue a new one and invalidate it.
+  const m = opt('macos');
+  if (m !== null) {
+    const on = /^(on|yes|true|1)$/i.test(m);
+    const rest = cfg.channels.filter((ch) => ch.type !== 'macos');
+    cfg.channels = on ? [...rest, { type: 'macos' }] : rest;
+    changed = true;
+    ok(on ? 'Mac banner on' : 'Mac banner off');
+    if (on && process.platform !== 'darwin') warn(`This is not a Mac (${process.platform}) — that channel will not fire.`);
+    else if (on) info(dim(MAC_PERMISSION_HINT));
+  }
+
+  if (changed) {
+    saveConfig(cfg);
+    // The hook that reads this config is a VENDORED COPY, and it may predate
+    // multi-channel — in which case it looks for `channel` and finds nothing,
+    // and notifications stop without a word. Refresh it whenever we change the
+    // shape of what it reads.
+    if (existsSync(RUNTIME_DST)) copyFileSync(RUNTIME_SRC, RUNTIME_DST);
+    return;
+  }
   console.log(JSON.stringify(cfg, null, 2));
 }
 
@@ -370,12 +447,13 @@ ${bold('agentbuzz')} — know the second your agent needs you
   ${bold('init')}        detect Claude Code, back up and merge hooks, send a test
   ${bold('test')}        send a notification that looks like a real one
   ${bold('status')}      what the hook has been doing, and why it has been quiet
-  ${bold('config')}      print config, or ${dim('--threshold <seconds>')} to change it
+  ${bold('config')}      print config, or ${dim('--threshold <sec>')} / ${dim('--macos on|off')} to change it
   ${bold('uninstall')}   remove only our hooks, restore nothing else
   ${bold('hook')}        internal: the hook entrypoint ${dim('(--dry-run to inspect)')}
 
   ${dim('init flags:')} --ntfy (deliver via ntfy.sh instead of the app)  --topic <name>
-              --threshold <sec>  --server <url>  --yes
+              --macos (banner on this Mac; on its own, no account needed)
+              --no-macos  --threshold <sec>  --server <url>  --yes
 `);
 }
 
