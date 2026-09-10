@@ -66,11 +66,11 @@ export function saveConfig(cfg) {
 
 /* ── log ────────────────────────────────────────────────────────────────── */
 
-export function logline(event, project, elapsed, action, detail = '') {
+export function logline(event, project, elapsed, action, detail = '', extra = {}) {
   try {
     mkdirSync(CONFIG_DIR, { recursive: true });
     appendFileSync(LOG_FILE, JSON.stringify({
-      ts: new Date().toISOString(), event, project, elapsed, action, detail
+      ts: new Date().toISOString(), event, project, elapsed, action, detail, ...extra
     }) + '\n');
   } catch { /* logging must never throw into the hook path */ }
 }
@@ -185,16 +185,132 @@ export function humanDuration(sec) {
   return `${Math.floor(sec / 3600)}h ${Math.floor((sec % 3600) / 60)}m`;
 }
 
-/** The three states the whole design system is built around. */
-export function classify(event) {
-  switch (event) {
-    case 'Notification':      return { status: 'blocked', suffix: 'needs you',     prio: 'high',    tags: 'bell' };
-    case 'PermissionRequest': return { status: 'blocked', suffix: 'permission',    prio: 'high',    tags: 'warning' };
-    case 'StopFailure':
-    case 'PostToolUseFailure':return { status: 'failed',  suffix: 'failed',        prio: 'high',    tags: 'x' };
-    case 'SessionEnd':        return { status: 'done',    suffix: 'session ended', prio: 'low',     tags: 'crescent_moon' };
-    default:                  return { status: 'done',    suffix: 'done',          prio: 'default', tags: 'white_check_mark' };
+/* ── agents ──────────────────────────────────────────────────────── */
+
+/**
+ * One adapter per agent, all the same shape — the same idea as the channel
+ * adapters further down, at the other end of the pipe. An agent is defined
+ * entirely by how its hook payload answers a handful of questions, so adding
+ * one is an entry here plus an install target in bin/agentbuzz.js, and nothing
+ * else.
+ *
+ * Every agent's own event names are mapped onto ONE canonical set of kinds, so
+ * that everything downstream — the threshold, dedupe, the note, the channels —
+ * is written once and never learns which agent it is serving:
+ *
+ *   prompt    a turn started; stamp the clock and say nothing
+ *   capture   the agent said something; remember it for the summary
+ *   done | failed | blocked | permission | session-end   → a notification
+ *   undefined an event mounted for its side effect only, or one that means the
+ *             user is already at the keyboard — say nothing
+ *
+ * That this table is the WHOLE of the difference between three agents is luck
+ * rather than design: Codex and Cursor both modelled their hooks on Claude
+ * Code's, down to JSON on stdin and a `hook_event_name` field.
+ */
+export const AGENTS = {
+  claude: {
+    label: 'Claude Code',
+    kinds: {
+      UserPromptSubmit: 'prompt',
+      Stop: 'done',
+      StopFailure: 'failed',
+      PostToolUseFailure: 'failed',
+      Notification: 'blocked',
+      PermissionRequest: 'permission',
+      SessionEnd: 'session-end'
+    },
+    cwd: (p) => p.cwd,
+    session: (p) => p.session_id,
+    tool: (p) => p.tool_name,
+    message: (p) => p.message,
+    /** The only transcript enrich() understands — it is Claude Code's schema. */
+    transcript: (p) => p.transcript_path
+  },
+
+  codex: {
+    label: 'Codex CLI',
+    kinds: {
+      UserPromptSubmit: 'prompt',
+      Stop: 'done',
+      PermissionRequest: 'permission',
+      SessionEnd: 'session-end'
+    },
+    cwd: (p) => p.cwd,
+    session: (p) => p.session_id,
+    tool: (p) => p.tool_name,
+    /**
+     * Codex hands us the final message outright, so its summary costs no file
+     * read at all. Its `transcript_path` is ignored ON PURPOSE: that file is a
+     * rollout log in Codex's own schema, and enrich() would parse it as zero
+     * usable records and return an empty summary without saying why.
+     */
+    text: (p) => p.last_assistant_message
+  },
+
+  cursor: {
+    label: 'Cursor',
+    kinds: {
+      beforeSubmitPrompt: 'prompt',
+      afterAgentResponse: 'capture'
+    },
+    /**
+     * `stop` carries its outcome in a field rather than in the event name. An
+     * ABORTED turn maps to no kind at all, deliberately: the user aborted it,
+     * so the user is at the keyboard, and a notification is noise.
+     *
+     * There is no blocked/permission kind here because Cursor has no event that
+     * means it. `beforeShellExecution` fires before EVERY command, approved or
+     * not, so pinging on it would fire constantly during an unattended run —
+     * the opposite of the product. See docs/PLAN.md § agents.
+     */
+    kind: (p) => p.hook_event_name === 'stop'
+      ? (p.status === 'error' ? 'failed' : p.status === 'completed' ? 'done' : undefined)
+      : undefined,
+    cwd: (p) => p.workspace_roots?.[0],
+    session: (p) => p.conversation_id,
+    /** afterAgentResponse text — stashed at `capture`, read back at `stop`. */
+    capture: (p) => p.text
   }
+};
+
+/**
+ * Flatten one agent's payload into the shape the rest of this file speaks.
+ * An unknown agent id falls back to Claude Code rather than throwing: the id
+ * arrives from a command line in someone's settings file, and rule 1 says a
+ * notification may never fail the user's run.
+ */
+export function normalizePayload(agentId, payload = {}) {
+  const a = AGENTS[agentId] ?? AGENTS.claude;
+  return {
+    agent: AGENTS[agentId] ? agentId : 'claude',
+    label: a.label,
+    kind: a.kinds?.[payload.hook_event_name] ?? a.kind?.(payload),
+    event: payload.hook_event_name || 'unknown',
+    project: basename(a.cwd?.(payload) || process.cwd()),
+    session: a.session?.(payload) || 'unknown',
+    tool: a.tool?.(payload) || '',
+    message: a.message?.(payload) || '',
+    text: a.text?.(payload) || '',
+    capture: a.capture?.(payload) || '',
+    transcript: a.transcript?.(payload) || ''
+  };
+}
+
+/** The three states the whole design system is built around, keyed by the
+ *  canonical kind that every agent's events are mapped onto. */
+export const KINDS = {
+  blocked:       { status: 'blocked', suffix: 'needs you',     prio: 'high',    tags: 'bell' },
+  permission:    { status: 'blocked', suffix: 'permission',    prio: 'high',    tags: 'warning' },
+  failed:        { status: 'failed',  suffix: 'failed',        prio: 'high',    tags: 'x' },
+  'session-end': { status: 'done',    suffix: 'session ended', prio: 'low',     tags: 'crescent_moon' },
+  done:          { status: 'done',    suffix: 'done',          prio: 'default', tags: 'white_check_mark' }
+};
+
+/** Claude Code's own event names, kept as a function of its own so the existing
+ *  call sites read unchanged. */
+export function classify(event) {
+  return KINDS[AGENTS.claude.kinds[event] ?? 'done'];
 }
 
 /* ── transcript enrichment — runs LOCALLY, always ───────────────────────── */
@@ -267,6 +383,26 @@ export function enrich(transcriptPath, tailLines) {
       .join(', ');
   }
   return out;
+}
+
+/**
+ * The summary half of enrich(), for agents that hand us their messages one at a
+ * time instead of a transcript. Same rule, same order: prefer the last thing
+ * the agent said that was not a between-tool-calls preamble, and fall back to
+ * the genuinely last thing rather than returning nothing.
+ */
+export function capturedSummary(file) {
+  let texts = [];
+  try {
+    texts = readFileSync(file, 'utf8').split('\n').filter(Boolean)
+      .map((l) => { try { return leadParagraph(JSON.parse(l)); } catch { return ''; } })
+      .filter(Boolean);
+  } catch { return ''; }
+
+  for (let i = texts.length - 1; i >= 0; i--) {
+    if (!isPreamble(texts[i])) return trimToSentence(texts[i]);
+  }
+  return texts.length ? trimToSentence(texts[texts.length - 1]) : '';
 }
 
 /* ── delivery ───────────────────────────────────────────────────────────── */
@@ -399,36 +535,47 @@ const asciiOnly = (s) => s.replace(/[^\x20-\x7E]/g, '').replace(/\s+/g, ' ').tri
 
 /* ── building the notification ──────────────────────────────────────────── */
 
-export function buildNote(payload, cfg, elapsed) {
-  const event = payload.hook_event_name || 'unknown';
-  const project = basename(payload.cwd || process.cwd());
-  const { status, suffix, prio, tags } = classify(event);
+export function buildNote(payload, cfg, elapsed, { agent = 'claude', captured = '' } = {}) {
+  const n = normalizePayload(agent, payload);
+  const { status, suffix, prio, tags } = KINDS[n.kind] ?? KINDS.done;
 
   let summary;
   // A "needs you" ping must carry the actual request. The generic transcript
   // summary is actively useless there: "wants permission to run rm -rf build/"
   // is the whole value of a blocked ping.
-  if (event === 'PermissionRequest') {
-    summary = `wants permission to use: ${payload.tool_name || 'a tool'}`;
-  } else if (event === 'Notification' && payload.message) {
-    summary = demarkdown(payload.message).slice(0, 180);
+  if (n.kind === 'permission') {
+    summary = `wants permission to use: ${n.tool || 'a tool'}`;
+  } else if (n.kind === 'blocked' && n.message) {
+    summary = demarkdown(n.message).slice(0, 180);
   }
 
-  const { summary: fromTranscript, tools, files } = enrich(payload.transcript_path, cfg.tail);
-  if (!summary) summary = fromTranscript || '(no summary)';
-  const changed = files ? `${files} file${files === 1 ? '' : 's'} changed · ` : '';
+  // Where the summary comes from is the one place the agents genuinely differ.
+  // Claude Code hands us a transcript in a schema we can mine for tool counts
+  // and changed files; Codex hands us the finished message and nothing else;
+  // Cursor hands us neither, so its messages were stashed as they arrived.
+  // Only the first of those three can produce a stat line richer than a
+  // duration, and pretending otherwise would mean inventing numbers.
+  const { summary: fromAgent, tools, files } = n.transcript
+    ? enrich(n.transcript, cfg.tail)
+    : { summary: captured || (n.text ? trimToSentence(leadParagraph(n.text)) : ''), tools: '', files: 0 };
+
+  if (!summary) summary = fromAgent || '(no summary)';
 
   const blocked = status === 'blocked';
   // The stat line is carried separately as well as folded into `body`: a macOS
   // banner has a real subtitle slot for it, and appending it to the summary
   // there reads as one run-on sentence. A blocked ping has no stats — what it
   // is blocked on is the whole message.
-  const stats = blocked ? '' : `${changed}${tools} · ${humanDuration(elapsed)}`;
+  const parts = [];
+  if (files) parts.push(`${files} file${files === 1 ? '' : 's'} changed`);
+  if (tools) parts.push(tools);
+  parts.push(humanDuration(elapsed));
+  const stats = blocked ? '' : parts.join(' · ');
 
   return {
-    event, project, status, elapsed,
-    rawTitle: `${project} — ${suffix}`,
-    title: `${project} — ${suffix}`,
+    event: n.event, agent: n.agent, project: n.project, status, elapsed,
+    rawTitle: `${n.project} — ${suffix}`,
+    title: `${n.project} — ${suffix}`,
     summary, stats,
     body: blocked ? summary : `${summary}\n— ${stats}`,
     prio, tags
@@ -465,53 +612,85 @@ function recordSent(note, now) {
     writeFileSync(dedupeFile(note), String(now));
     // Sweep stale markers so the directory cannot grow without bound.
     for (const name of readdirSync(STATE_DIR)) {
-      if (!name.startsWith('dedupe.')) continue;
+      // Dedupe markers expire with their window. A turn's start stamp and its
+      // captured text must outlive it — a turn can legitimately run for hours —
+      // so those are swept only once they cannot belong to a live session.
+      const ttl = name.startsWith('dedupe.') ? 3600
+                : /\.(start|text)$/.test(name) ? 86400
+                : 0;
+      if (!ttl) continue;
       const p = join(STATE_DIR, name);
-      if (now - Math.floor(statSync(p).mtimeMs / 1000) > 3600) unlinkSync(p);
+      if (now - Math.floor(statSync(p).mtimeMs / 1000) > ttl) unlinkSync(p);
     }
   } catch {}
 }
 
 /* ── the hook entrypoint ────────────────────────────────────────────────── */
 
-export async function runHook(payload, { dryRun = false } = {}) {
+export async function runHook(payload, { dryRun = false, agent = 'claude' } = {}) {
   const cfg = loadConfig();
   const now = Math.floor(Date.now() / 1000);
-  const event = payload.hook_event_name || 'unknown';
-  const project = basename(payload.cwd || process.cwd());
-  const session = payload.session_id || 'unknown';
+  const n = normalizePayload(agent, payload);
+  const { event, project, session, kind } = n;
   const startFile = join(STATE_DIR, `${session}.start`);
+  const textFile = join(STATE_DIR, `${session}.text`);
+  const tag = { agent: n.agent, kind: kind ?? 'none' };
 
-  // UserPromptSubmit: stamp the turn start and say nothing. Duration measured
-  // this way is exact and costs nothing, unlike inferring it from timestamps.
-  if (event === 'UserPromptSubmit') {
-    try { mkdirSync(STATE_DIR, { recursive: true }); writeFileSync(startFile, String(now)); } catch {}
+  // Turn start: stamp the clock and say nothing. Duration measured this way is
+  // exact and costs nothing, unlike inferring it from timestamps.
+  if (kind === 'prompt') {
+    try {
+      mkdirSync(STATE_DIR, { recursive: true });
+      writeFileSync(startFile, String(now));
+      // Forget what the previous turn said, or its wrap-up becomes this turn's
+      // summary — the transcript agents get this for free from turn scoping.
+      if (existsSync(textFile)) unlinkSync(textFile);
+    } catch {}
     return { action: 'stamped' };
   }
+
+  // An agent with no readable transcript can still be summarised, as long as
+  // its messages are caught on the way past. Appended rather than overwritten:
+  // the LAST message of a turn is often a preamble ("Now running the tests:"),
+  // and picking the last useful one needs the earlier ones still around.
+  if (kind === 'capture') {
+    if (n.capture.trim()) {
+      try {
+        mkdirSync(STATE_DIR, { recursive: true });
+        appendFileSync(textFile, JSON.stringify(n.capture) + '\n');
+      } catch {}
+    }
+    return { action: 'captured' };
+  }
+
+  // An event we mounted for a side effect, or one that means the user is
+  // already at the keyboard. Not an error, and not worth a log line.
+  if (!kind) return { action: 'ignored', event };
 
   let start = now;
   try { start = parseInt(readFileSync(startFile, 'utf8'), 10) || now; } catch {}
   const elapsed = Math.max(0, now - start);
 
-  // The duration gate. Stop fires on EVERY turn, so without this the product is
-  // a notification every twenty seconds — a v1 correctness requirement, not a
-  // paid feature.
-  if (event === 'Stop' && elapsed < cfg.threshold) {
-    logline(event, project, elapsed, 'suppressed-short');
+  // The duration gate. A finished turn fires on EVERY turn, so without this the
+  // product is a notification every twenty seconds — a v1 correctness
+  // requirement, not a paid feature.
+  if (kind === 'done' && elapsed < cfg.threshold) {
+    logline(event, project, elapsed, 'suppressed-short', '', tag);
     return { action: 'suppressed-short', elapsed };
   }
 
   if (!cfg.channels.length && !dryRun) {
-    logline(event, project, elapsed, 'error', 'no channel configured');
+    logline(event, project, elapsed, 'error', 'no channel configured', tag);
     return { action: 'error', detail: 'no channel configured' };
   }
 
-  const note = buildNote(payload, cfg, elapsed);
+  const captured = AGENTS[n.agent]?.capture ? capturedSummary(textFile) : '';
+  const note = buildNote(payload, cfg, elapsed, { agent: n.agent, captured });
 
   if (dryRun) return { action: 'dryrun', note };
 
   if (isDuplicate(note, cfg.dedupe, now)) {
-    logline(event, project, elapsed, 'suppressed-dupe');
+    logline(event, project, elapsed, 'suppressed-dupe', '', tag);
     return { action: 'suppressed-dupe', note };
   }
 
@@ -521,16 +700,31 @@ export async function runHook(payload, { dryRun = false } = {}) {
     // Detail is logged on success too, now that there can be more than one
     // channel: "relay: http 200 · macos: timed out" is the only place a partial
     // failure is ever visible.
-    logline(event, project, elapsed, ok ? 'sent' : 'error', detail);
+    logline(event, project, elapsed, ok ? 'sent' : 'error', detail, tag);
     return { action: ok ? 'sent' : 'error', detail, note };
   } catch (err) {
     // Timeouts land here. The run continues regardless — that is the point.
-    logline(event, project, elapsed, 'error', String(err?.message || err).slice(0, 120));
+    logline(event, project, elapsed, 'error', String(err?.message || err).slice(0, 120), tag);
     return { action: 'error', detail: String(err?.message || err) };
   }
 }
 
 /* ── main ───────────────────────────────────────────────────────────────── */
+
+/**
+ * Which agent is on the other end of this pipe, from the `--agent` the
+ * installer wrote into the hook command.
+ *
+ * Defaults to Claude Code when absent, and that default is load-bearing rather
+ * than cosmetic: every hook installed before multi-agent support says plain
+ * `node hook.mjs`, and those installs must keep working across the upgrade
+ * without anyone re-running init.
+ */
+export function agentFromArgv(argv = process.argv) {
+  const i = argv.indexOf('--agent');
+  const id = i !== -1 ? argv[i + 1] : null;
+  return id && AGENTS[id] ? id : 'claude';
+}
 
 async function main() {
   let raw = '';
@@ -541,7 +735,7 @@ async function main() {
   catch { logline('unknown', '', 0, 'error', 'unparseable payload'); return; }
 
   const dryRun = process.env.AGENTBUZZ_DRYRUN === '1';
-  const result = await runHook(payload, { dryRun });
+  const result = await runHook(payload, { dryRun, agent: agentFromArgv() });
   if (dryRun) process.stdout.write(JSON.stringify(result, null, 2) + '\n');
 }
 

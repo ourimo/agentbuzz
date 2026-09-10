@@ -21,3 +21,6 @@ jobs:
       # No install step on purpose — this package has zero dependencies, and a
       # CI that never runs `npm install` is a standing proof of that.
       - run: node test/run.mjs
+      # The installer test writes real hook files into a throwaway home and
+      # runs the real init/uninstall against all three agents.
+      - run: node test/install.mjs

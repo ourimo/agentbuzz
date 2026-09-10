@@ -8,7 +8,8 @@ import { platform } from 'node:os';
 import {
   demarkdown, trimToSentence, leadParagraph, isPreamble,
   classify, humanDuration, enrich, buildNote, DEFAULTS,
-  normalizeConfig, macArgs, deliver, adapters
+  normalizeConfig, macArgs, deliver, adapters,
+  AGENTS, KINDS, normalizePayload, capturedSummary, agentFromArgv
 } from '../runtime/hook.mjs';
 
 let pass = 0, fail = 0;
@@ -167,6 +168,86 @@ eq('a throwing adapter does not stop the others',
    (await deliver([{ type: 'boom' }, { type: 'stub' }], {})).ok, true);
 eq('a bare channel object still delivers', (await deliver({ type: 'stub' }, {})).ok, true);
 eq('one result per channel', (await deliver([{ type: 'stub' }, { type: 'stub' }], {})).results.length, 2);
+
+/* ── agents: every event mapped onto one canonical kind ─────────────────── */
+const kindOf = (agent, payload) => normalizePayload(agent, payload).kind;
+
+eq('claude Stop is done',        kindOf('claude', { hook_event_name: 'Stop' }), 'done');
+eq('claude permission',          kindOf('claude', { hook_event_name: 'PermissionRequest' }), 'permission');
+eq('codex Stop is done',         kindOf('codex',  { hook_event_name: 'Stop' }), 'done');
+eq('codex permission',           kindOf('codex',  { hook_event_name: 'PermissionRequest' }), 'permission');
+eq('cursor prompt',              kindOf('cursor', { hook_event_name: 'beforeSubmitPrompt' }), 'prompt');
+eq('cursor capture',             kindOf('cursor', { hook_event_name: 'afterAgentResponse' }), 'capture');
+// Cursor puts the outcome in a field, not the event name.
+eq('cursor stop completed',      kindOf('cursor', { hook_event_name: 'stop', status: 'completed' }), 'done');
+eq('cursor stop error',          kindOf('cursor', { hook_event_name: 'stop', status: 'error' }), 'failed');
+// An aborted turn means the user is at the keyboard. Telling them is noise.
+eq('cursor abort is silent',     kindOf('cursor', { hook_event_name: 'stop', status: 'aborted' }), undefined);
+// Codex has no Interrupt mapping, and an unmounted event must stay silent
+// rather than falling through to "done".
+eq('an unmapped event is silent', kindOf('codex', { hook_event_name: 'Interrupt' }), undefined);
+// Rule 1 reaches even here: a bad --agent may not throw inside a user's run.
+eq('an unknown agent falls back', normalizePayload('nope', { hook_event_name: 'Stop' }).agent, 'claude');
+
+// The project name comes from a different field in each payload.
+eq('claude cwd',    normalizePayload('claude', { cwd: '/x/checkout' }).project, 'checkout');
+eq('codex cwd',     normalizePayload('codex',  { cwd: '/x/api' }).project, 'api');
+eq('cursor roots',  normalizePayload('cursor', { workspace_roots: ['/x/web'] }).project, 'web');
+eq('cursor session', normalizePayload('cursor', { conversation_id: 'c1' }).session, 'c1');
+
+/* ── the summary, from whatever the agent actually hands over ───────────── */
+// Codex carries the final message in the payload, so it needs no transcript —
+// and must NOT be sent through enrich(), whose schema is Claude Code's alone.
+const codex = buildNote({
+  hook_event_name: 'Stop', cwd: '/x/api', session_id: 's1',
+  transcript_path: '/does/not/matter.jsonl',
+  last_assistant_message: '**Migration applied** and the suite is green.\n\nDetails follow.'
+}, DEFAULTS, 200, { agent: 'codex' });
+eq('codex title', codex.title, 'api — done');
+eq('codex summary is the last message', codex.summary, 'Migration applied and the suite is green.');
+// No transcript means no tool counts, and inventing them would be a lie —
+// the duration is all an honest stat line can hold.
+eq('codex stats are duration only', codex.stats, '3m 20s');
+eq('codex body', codex.body, 'Migration applied and the suite is green.\n— 3m 20s');
+
+const codexPerm = buildNote(
+  { hook_event_name: 'PermissionRequest', cwd: '/x/api', tool_name: 'shell' }, DEFAULTS, 12, { agent: 'codex' });
+eq('codex blocked title', codexPerm.title, 'api — permission');
+eq('codex blocked body', codexPerm.body, 'wants permission to use: shell');
+
+/* ── capturedSummary: the transcript-less summary path ──────────────────── */
+const capFile = join(dir, 'cap.jsonl');
+writeFileSync(capFile, [
+  JSON.stringify('Let me check the config:'),
+  JSON.stringify('**Build is green** and `npm test` passes.'),
+  JSON.stringify('Now running the linter:')
+].join('\n') + '\n');
+// Same rule as enrich(): the last thing said that was not a preamble.
+eq('captured skips trailing preamble', capturedSummary(capFile), 'Build is green and npm test passes.');
+eq('no capture file is empty, not a throw', capturedSummary(join(dir, 'nope.jsonl')), '');
+writeFileSync(join(dir, 'only.jsonl'), JSON.stringify('Now testing it —') + '\n');
+ok_('falls back rather than returning nothing', capturedSummary(join(dir, 'only.jsonl')).length > 0);
+
+const cursorNote = buildNote(
+  { hook_event_name: 'stop', status: 'completed', workspace_roots: ['/x/web'], conversation_id: 'c1' },
+  DEFAULTS, 95, { agent: 'cursor', captured: 'Both changes are in and verified.' });
+eq('cursor summary is the captured text', cursorNote.summary, 'Both changes are in and verified.');
+eq('cursor body', cursorNote.body, 'Both changes are in and verified.\n— 1m 35s');
+
+/* ── which agent is on the other end of the pipe ────────────────────────── */
+eq('--agent is read', agentFromArgv(['node', 'hook.mjs', '--agent', 'codex']), 'codex');
+// Load-bearing: hooks installed before multi-agent support say plain
+// `node hook.mjs`, and must keep working without anyone re-running init.
+eq('no flag means claude', agentFromArgv(['node', 'hook.mjs']), 'claude');
+eq('a bogus agent means claude', agentFromArgv(['node', 'hook.mjs', '--agent', 'nope']), 'claude');
+eq('a dangling flag means claude', agentFromArgv(['node', 'hook.mjs', '--agent']), 'claude');
+
+// Every agent's kinds must exist in KINDS, or an event maps to an undefined
+// status and the note is built from nothing.
+for (const [id, a] of Object.entries(AGENTS)) {
+  const kinds = Object.values(a.kinds ?? {}).filter((k) => k !== 'prompt' && k !== 'capture');
+  ok_(`${id} kinds are all known`, kinds.every((k) => k in KINDS));
+}
 
 console.log(`\n${fail ? '✗' : '✓'} ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

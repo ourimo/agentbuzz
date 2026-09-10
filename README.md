@@ -4,6 +4,9 @@
 the prompt lands on your iPhone and Apple Watch — tap Allow, or dictate the next
 instruction, and it carries on. It also tells you when a run finishes or breaks.
 
+Works with **Claude Code**, **Codex CLI** and **Cursor**. `init` wires up
+whichever of them it finds.
+
 ```bash
 npx agentbuzz init
 ```
@@ -11,15 +14,15 @@ npx agentbuzz init
 [agentnotify.web.app](https://agentnotify.web.app) · [support](https://agentnotify.web.app/support)
 
 This repository is the **local client**: the hook runtime that runs on your
-machine, and the installer that wires it into Claude Code. It is the part that
+machine, and the installer that wires it into your agents. It is the part that
 reads your transcripts, so it is the part worth reading before you run it.
 
 ---
 
 ## Your code never leaves your machine
 
-A Claude Code hook hands us a **file path**, not a conversation. The transcript
-is read locally to build a one-line summary, and only that summary is sent:
+An agent hook hands us a **file path**, not a conversation. The transcript is
+read locally to build a one-line summary, and only that summary is sent:
 
 ```json
 { "project": "checkout", "status": "blocked",
@@ -88,20 +91,49 @@ something that runs on every turn:
 `npx agentbuzz uninstall` removes only our hooks and leaves every other tool's
 alone.
 
-Hooks are read once at session start, so **restart Claude Code** after
-installing or nothing happens.
+Hooks are read once at session start, so **restart the agent** after installing
+or nothing happens.
+
+## Which agents, and what each one can tell you
+
+| | Claude Code | Codex CLI | Cursor |
+|---|---|---|---|
+| Hooks file | `~/.claude/settings.json` | `~/.codex/hooks.json` | `~/.cursor/hooks.json` |
+| Run finished | ✅ | ✅ | ✅ |
+| Run failed | ✅ | ✅ | ✅ |
+| **Waiting for permission** | ✅ | ✅ | ❌ |
+| Tool and file stats | ✅ | duration only | duration only |
+
+Two honest gaps, both of them the agent's rather than ours:
+
+- **Cursor cannot tell us it is blocked.** It has no hook meaning "waiting for
+  you" — `beforeShellExecution` fires before *every* command, approved or not,
+  so using it would ping you constantly during the unattended run you walked
+  away from. Cursor reports finished and failed runs only.
+- **Only Claude Code produces `4 files changed · 12× Read · 1m 12s`.** That
+  comes from parsing its transcript. Codex hands over its final message and
+  nothing else, Cursor exposes no transcript we can read, so both fall back to
+  the duration. We would rather show less than invent it.
+
+Cursor's hooks are read by the **Cursor IDE agent** as well as `cursor-agent`
+on the command line, so this works without a terminal agent at all.
+
+`init` wires up every agent it finds. `--agent claude,codex` restricts it;
+`uninstall` always sweeps all three, whatever you installed.
 
 ## Commands
 
 | | |
 |---|---|
-| `init` | Detect Claude Code, back up and merge hooks, pair, send a test |
+| `init` | Detect your agents, back up and merge hooks, pair, send a test |
 | `test` | Send a notification that looks like a real one |
 | `status` | What the hook has been doing — and why it has been quiet |
 | `config` | Print config, or `--threshold <sec>` / `--macos on\|off` to change it |
 | `uninstall` | Remove only our hooks |
 
-Flags for `init`: `--ntfy` (deliver via ntfy instead of the app), `--macos`
+Flags for `init`: `--agent <ids>` (`claude`, `codex`, `cursor` — comma
+separated; default is every one detected), `--ntfy` (deliver via ntfy instead
+of the app), `--macos`
 (banner on this Mac — on its own, no account is needed), `--no-macos`,
 `--topic <name>`, `--threshold <sec>`, `--server <url>`, `--yes`.
 
@@ -111,8 +143,8 @@ nothing here ever retries.
 
 ## Quiet by default
 
-`Stop` fires every time the agent finishes responding — in normal back-and-forth
-that is a notification every twenty seconds. Turns shorter than the threshold
+A finished turn fires every time the agent stops responding — in normal
+back-and-forth that is a notification every twenty seconds. Turns shorter than the threshold
 (90s by default) stay silent, and identical notifications inside 60s are
 deduplicated.
 

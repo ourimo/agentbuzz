@@ -21,20 +21,77 @@ import { hostname } from 'node:os';
 
 import {
   CONFIG_DIR, loadConfig, saveConfig, DEFAULTS,
-  runHook, deliver, humanDuration, readLog
+  runHook, deliver, humanDuration, readLog, agentFromArgv
 } from '../runtime/hook.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const RUNTIME_SRC = join(HERE, '..', 'runtime', 'hook.mjs');
 const RUNTIME_DST = join(CONFIG_DIR, 'hook.mjs');
-// Overridable so the installer can be tested without touching a real config.
-const CLAUDE_SETTINGS = process.env.AGENTBUZZ_CLAUDE_SETTINGS || join(homedir(), '.claude', 'settings.json');
 const API = process.env.AGENTBUZZ_API || 'https://europe-west1-agentnotify.cloudfunctions.net/api';
 
-/** Every event we mount. Chosen from what the installed Claude Code actually
- *  emits — `PermissionRequest` was found empirically in a live setup, not
- *  inferred from docs, and it is the most valuable of the four. */
-const EVENTS = ['UserPromptSubmit', 'Stop', 'StopFailure', 'Notification', 'PermissionRequest'];
+/**
+ * Where each agent keeps its hooks, and which of its events we mount. The
+ * runtime half of this lives in AGENTS in runtime/hook.mjs; this half is only
+ * about files on disk.
+ *
+ * `format` is the one real incompatibility between the three. Claude Code and
+ * Codex nest the commands a level deeper —
+ *   { "Stop": [ { "hooks": [ { "type": "command", "command": "…" } ] } ] }
+ * — while Cursor lists them flat:
+ *   { "stop":  [ { "type": "command", "command": "…" } ] }
+ *
+ * `shared` marks a file that is not ours to invent. ~/.claude/settings.json
+ * holds a user's model, permissions and everything else, so its absence means
+ * Claude Code was never run and we stop. The other two are dedicated hook
+ * files: creating one is the normal way to add a hook, so we do.
+ *
+ * Paths are overridable so the installer can be tested end to end without
+ * going anywhere near a real config.
+ */
+const AGENT_TARGETS = {
+  claude: {
+    label: 'Claude Code',
+    file: process.env.AGENTBUZZ_CLAUDE_SETTINGS || join(homedir(), '.claude', 'settings.json'),
+    home: join(homedir(), '.claude'),
+    format: 'nested',
+    shared: true,
+    // Chosen from what the installed Claude Code actually emits —
+    // `PermissionRequest` was found empirically in a live setup, not inferred
+    // from docs, and it is the most valuable of the five.
+    events: ['UserPromptSubmit', 'Stop', 'StopFailure', 'Notification', 'PermissionRequest']
+  },
+  codex: {
+    label: 'Codex CLI',
+    file: process.env.AGENTBUZZ_CODEX_HOOKS || join(homedir(), '.codex', 'hooks.json'),
+    home: process.env.AGENTBUZZ_CODEX_HOME || join(homedir(), '.codex'),
+    format: 'nested',
+    shared: false,
+    // Codex's Stop carries `last_assistant_message`, so it needs no transcript.
+    // Interrupt is deliberately not mounted: it means the user pressed Ctrl-C,
+    // and someone who just pressed Ctrl-C does not need to be told about it.
+    events: ['UserPromptSubmit', 'Stop', 'PermissionRequest']
+  },
+  cursor: {
+    label: 'Cursor',
+    file: process.env.AGENTBUZZ_CURSOR_HOOKS || join(homedir(), '.cursor', 'hooks.json'),
+    home: process.env.AGENTBUZZ_CURSOR_HOME || join(homedir(), '.cursor'),
+    format: 'flat',
+    shared: false,
+    // afterAgentResponse is the summary source — Cursor exposes no transcript
+    // we can parse — and `stop` is the notification. No permission event is
+    // mounted because Cursor has none that means "waiting for you": its
+    // beforeShellExecution fires before every command, approved or not.
+    events: ['beforeSubmitPrompt', 'afterAgentResponse', 'stop']
+  }
+};
+
+/** An agent counts as present if its own config directory is there. Each has a
+ *  separate hooks file, so nothing here can be confused for another. */
+const detectAgents = () => Object.keys(AGENT_TARGETS).filter((id) =>
+  AGENT_TARGETS[id].shared ? existsSync(AGENT_TARGETS[id].file) : existsSync(AGENT_TARGETS[id].home));
+
+/** The `--agent` is what tells the runtime whose payload it is reading. */
+const hookCommand = (id) => `node ${RUNTIME_DST} --agent ${id}`;
 
 /* ── tiny terminal helpers ──────────────────────────────────────────────── */
 const tty = process.stdout.isTTY;
@@ -94,6 +151,21 @@ function readSettings(path) {
   }
 }
 
+/** Write a hooks file back, preserving whatever else was in it. Cursor
+ *  validates a top-level `version`, so a file we create must carry one. */
+function writeHookFile(target, data) {
+  mkdirSync(dirname(target.file), { recursive: true });
+  if (target.format === 'flat' && data.version === undefined) data.version = 1;
+  writeFileSync(target.file, JSON.stringify(data, null, 2) + '\n');
+}
+
+/** Is this agent wired up right now? Each agent owns its own hooks file, so
+ *  our marker appearing anywhere in it is answer enough. */
+const isWired = (target) => {
+  try { return existsSync(target.file) && isOurs(readFileSync(target.file, 'utf8')); }
+  catch { return false; }
+};
+
 function backup(path) {
   const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+/, '').replace('T', '');
   const dst = `${path}.${stamp}.bak`;
@@ -101,37 +173,57 @@ function backup(path) {
   return dst;
 }
 
-/** Strip only OUR hook entries, preserving everyone else's. */
+/**
+ * Strip only OUR hook entries, preserving everyone else's.
+ *
+ * Shape-agnostic on purpose: it is also the uninstaller, and it must be able to
+ * clean a file whose format it was not told. An entry that nests a `hooks`
+ * array is Claude Code's or Codex's; anything else is read as a flat Cursor
+ * entry. Neither branch touches an entry it does not recognise as ours.
+ */
 function stripOurs(hooks) {
   const out = {};
   let removed = 0;
   for (const [event, entries] of Object.entries(hooks ?? {})) {
     const kept = [];
     for (const entry of entries ?? []) {
-      const inner = (entry.hooks ?? []).filter((h) => {
-        if (isOurs(h.command)) { removed++; return false; }
-        return true;
-      });
-      if (inner.length) kept.push({ ...entry, hooks: inner });
+      if (Array.isArray(entry?.hooks)) {
+        const inner = entry.hooks.filter((h) => {
+          if (isOurs(h?.command)) { removed++; return false; }
+          return true;
+        });
+        if (inner.length) kept.push({ ...entry, hooks: inner });
+      } else if (isOurs(entry?.command)) {
+        removed++;
+      } else {
+        kept.push(entry);
+      }
     }
     if (kept.length) out[event] = kept;
   }
   return { hooks: out, removed };
 }
 
-function addOurs(hooks) {
+/** Count the hook commands in a file, split into ours and everyone else's. */
+function countHooks(hooks) {
+  const commands = Object.values(hooks ?? {}).flat()
+    .flatMap((e) => (Array.isArray(e?.hooks) ? e.hooks.map((h) => h?.command) : [e?.command]));
+  return {
+    ours: commands.filter((c) => isOurs(c)).length,
+    others: commands.filter((c) => c !== undefined && !isOurs(c)).length
+  };
+}
+
+function addOurs(hooks, target, command) {
   const out = { ...hooks };
-  for (const event of EVENTS) {
-    const entry = {
-      hooks: [{
-        type: 'command',
-        // async so a notification can never cost the user latency, and a hard
-        // timeout so it can never hang a session even if async changed.
-        async: true,
-        timeout: 10,
-        command: `node ${RUNTIME_DST}`
-      }]
-    };
+  for (const event of target.events) {
+    // async so a notification can never cost the user latency, and a hard
+    // timeout so it can never hang a session even if async changed. Cursor
+    // documents no async flag, so there the timeout carries the guarantee
+    // alone — which is also why nothing is mounted on its per-tool events.
+    const entry = target.format === 'flat'
+      ? { type: 'command', timeout: 10, command }
+      : { hooks: [{ type: 'command', async: true, timeout: 10, command }] };
     out[event] = [...(out[event] ?? []), entry];
   }
   return out;
@@ -142,32 +234,73 @@ function addOurs(hooks) {
 async function cmdInit() {
   console.log(`\n${bold('agentbuzz')} ${dim('· setup')}\n`);
 
-  // 1. Detect
-  const s = readSettings(CLAUDE_SETTINGS);
-  if (!s.exists) {
-    err(`No Claude Code settings found at ${CLAUDE_SETTINGS}`);
-    info('Install and run Claude Code once, then try again.');
+  // 1. Detect every agent, or just the ones named with --agent.
+  const requested = opt('agent');
+  const ids = requested
+    ? requested.split(',').map((x) => x.trim()).filter(Boolean)
+    : detectAgents();
+
+  const unknown = ids.filter((id) => !AGENT_TARGETS[id]);
+  if (unknown.length) {
+    err(`Unknown agent: ${unknown.join(', ')}`);
+    info(`Known agents: ${Object.keys(AGENT_TARGETS).join(', ')}`);
     process.exitCode = 1;
     return;
   }
-  if (s.data === null) {
-    err(`${CLAUDE_SETTINGS} is not valid JSON — ${s.error}`);
-    info('Fix or move that file first. Refusing to rewrite it.');
+  if (!ids.length) {
+    err('No supported agent found on this machine.');
+    for (const t of Object.values(AGENT_TARGETS)) {
+      info(`Looked for ${t.label}  ${dim((t.shared ? t.file : t.home).replace(homedir(), '~'))}`);
+    }
+    info('Install and run one of them once, then try again.');
     process.exitCode = 1;
     return;
   }
-  ok(`Found Claude Code  ${dim(CLAUDE_SETTINGS)}`);
 
-  const existingHooks = s.data.hooks ?? {};
-  const otherCount = Object.values(existingHooks).flat()
-    .flatMap((e) => e.hooks ?? []).filter((h) => !isOurs(h.command)).length;
-  const oursCount = Object.values(existingHooks).flat()
-    .flatMap((e) => e.hooks ?? []).filter((h) => isOurs(h.command)).length;
+  // Read every target BEFORE touching any of them. A run that configures Codex
+  // and then dies on unparseable Cursor JSON leaves the user half-installed and
+  // with no idea which half.
+  const targets = [];
+  for (const id of ids) {
+    const t = AGENT_TARGETS[id];
+    const f = readSettings(t.file);
+    if (f.data === null) {
+      err(`${t.label}: ${t.file.replace(homedir(), '~')} is not valid JSON — ${f.error}`);
+      info('Fix or move that file first. Refusing to rewrite it.');
+      process.exitCode = 1;
+      return;
+    }
+    // A shared config we did not create is proof the agent was never run.
+    if (t.shared && !f.exists) {
+      if (requested) {
+        err(`No ${t.label} settings at ${t.file.replace(homedir(), '~')} — run it once first.`);
+        process.exitCode = 1;
+        return;
+      }
+      continue;
+    }
+    targets.push({ id, t, f });
+    ok(`Found ${t.label}  ${dim(t.file.replace(homedir(), '~'))}${f.exists ? '' : dim(' (will be created)')}`);
+  }
+  if (!targets.length) { err('Nothing to configure.'); process.exitCode = 1; return; }
 
-  if (otherCount) info(`${otherCount} hook${otherCount === 1 ? '' : 's'} from other tools — these will be preserved`);
-  if (oursCount) warn(`${oursCount} existing agentbuzz hook${oursCount === 1 ? '' : 's'} — these will be replaced`);
+  const totals = targets.reduce((acc, { f }) => {
+    const c = countHooks(f.data.hooks ?? {});
+    return { ours: acc.ours + c.ours, others: acc.others + c.others };
+  }, { ours: 0, others: 0 });
 
-  if (!(await confirm('Configure it for notifications?'))) { info('Nothing changed.'); return; }
+  if (totals.others) info(`${totals.others} hook${totals.others === 1 ? '' : 's'} from other tools — these will be preserved`);
+  if (totals.ours) warn(`${totals.ours} existing agentbuzz hook${totals.ours === 1 ? '' : 's'} — these will be replaced`);
+
+  // Cursor has no event meaning "waiting for you", so it can report a finished
+  // or failed run and nothing else. Said here rather than discovered later,
+  // when a permission prompt sits unanswered and the phone stays silent.
+  if (targets.some(({ id }) => id === 'cursor')) {
+    warn('Cursor: done and failed only — it exposes no "waiting for approval" event.');
+  }
+
+  const names = targets.map(({ t }) => t.label).join(', ');
+  if (!(await confirm(`Configure ${names} for notifications?`))) { info('Nothing changed.'); return; }
 
   // 2. Channels.
   const cfg = loadConfig();
@@ -212,14 +345,17 @@ async function cmdInit() {
   if (wantsMac) channels.push({ type: 'macos' });
   cfg.channels = channels;
 
-  // 3. Back up, then merge.
-  const bak = backup(CLAUDE_SETTINGS);
-  ok(`Backed up  ${dim(bak.replace(homedir(), '~'))}`);
-
-  const stripped = stripOurs(existingHooks);
-  s.data.hooks = addOurs(stripped.hooks);
-  writeFileSync(CLAUDE_SETTINGS, JSON.stringify(s.data, null, 2) + '\n');
-  ok(`Added hooks  ${dim(EVENTS.join(', '))}`);
+  // 3. Back up, then merge — one agent at a time.
+  for (const { id, t, f } of targets) {
+    if (f.exists) {
+      const bak = backup(t.file);
+      ok(`Backed up  ${dim(bak.replace(homedir(), '~'))}`);
+    }
+    const stripped = stripOurs(f.data.hooks ?? {});
+    f.data.hooks = addOurs(stripped.hooks, t, hookCommand(id));
+    writeHookFile(t, f.data);
+    ok(`${t.label} hooks  ${dim(t.events.join(', '))}`);
+  }
 
   // 4. Vendor the runtime so the hook command survives npx's temp directory.
   mkdirSync(CONFIG_DIR, { recursive: true });
@@ -243,7 +379,7 @@ async function cmdInit() {
 
   // 6. Say the restart line out loud. Hooks are snapshotted at session start;
   //    skipping this makes users conclude it is broken within 60 seconds.
-  console.log(`\n  ${bold('Restart Claude Code')} to load the hooks.`);
+  console.log(`\n  ${bold(`Restart ${names}`)} to load the hooks.`);
   console.log(`  You'll be pinged when a run takes longer than ${bold(cfg.threshold + 's')} — short turns stay quiet.\n`);
 }
 
@@ -333,20 +469,33 @@ async function sendTest(cfg = loadConfig()) {
 
 async function cmdUninstall() {
   console.log(`\n${bold('agentbuzz')} ${dim('· uninstall')}\n`);
-  const s = readSettings(CLAUDE_SETTINGS);
-  if (!s.exists || s.data === null) { err('No readable settings.json — nothing to do.'); return; }
 
-  const { hooks, removed } = stripOurs(s.data.hooks ?? {});
-  if (!removed) { info('No agentbuzz hooks found.'); return; }
+  // Every known agent is swept, whatever `init` was asked for at the time —
+  // uninstall leaving hooks behind on an agent the user forgot about is the
+  // one failure mode that gets a tool called broken after it is gone.
+  const cleaned = [];
+  let total = 0;
+  for (const [id, t] of Object.entries(AGENT_TARGETS)) {
+    const f = readSettings(t.file);
+    if (!f.exists) continue;
+    if (f.data === null) { warn(`${t.label}: ${t.file.replace(homedir(), '~')} is not valid JSON — left alone.`); continue; }
 
-  const bak = backup(CLAUDE_SETTINGS);
-  if (Object.keys(hooks).length) s.data.hooks = hooks; else delete s.data.hooks;
-  writeFileSync(CLAUDE_SETTINGS, JSON.stringify(s.data, null, 2) + '\n');
+    const { hooks, removed } = stripOurs(f.data.hooks ?? {});
+    if (!removed) continue;
 
-  ok(`Backed up  ${dim(bak.replace(homedir(), '~'))}`);
-  ok(`Removed ${removed} agentbuzz hook${removed === 1 ? '' : 's'} — every other hook left alone`);
+    const bak = backup(t.file);
+    if (Object.keys(hooks).length) f.data.hooks = hooks; else delete f.data.hooks;
+    writeHookFile(t, f.data);
+
+    ok(`Backed up  ${dim(bak.replace(homedir(), '~'))}`);
+    ok(`${t.label} — removed ${removed} hook${removed === 1 ? '' : 's'}, every other hook left alone`);
+    cleaned.push(t.label);
+    total += removed;
+  }
+
+  if (!total) { info('No agentbuzz hooks found.'); return; }
   info(`Config kept at ${CONFIG_DIR.replace(homedir(), '~')} — delete it by hand if you want it gone.`);
-  console.log(`\n  ${bold('Restart Claude Code')} to apply.\n`);
+  console.log(`\n  ${bold(`Restart ${cleaned.join(', ')}`)} to apply.\n`);
 }
 
 /** The silence problem: with a threshold, a working install can be silent for
@@ -362,10 +511,17 @@ function cmdStatus() {
   info(`Threshold  ${cfg.threshold}s`);
   // isOurs, not a literal — the hook path is ~/.config/agentbuzz, which the old
   // /agent-?notify/ pattern never matched, so this always read NOT installed.
-  const installed = existsSync(RUNTIME_DST) && isOurs(
-    existsSync(CLAUDE_SETTINGS) ? readFileSync(CLAUDE_SETTINGS, 'utf8') : ''
-  );
+  const wired = Object.entries(AGENT_TARGETS).filter(([, t]) => isWired(t));
+  const installed = existsSync(RUNTIME_DST) && wired.length > 0;
   info(`Hooks      ${installed ? green('installed') : red('NOT installed')}`);
+  if (installed) {
+    info(`Agents     ${wired.map(([, t]) => t.label).join(', ')}`);
+    const missing = Object.entries(AGENT_TARGETS)
+      .filter(([id, t]) => !isWired(t) && detectAgents().includes(id));
+    if (missing.length) {
+      info(dim(`${missing.map(([, t]) => t.label).join(', ')} installed but not wired — agentbuzz init`));
+    }
+  }
 
   if (!log.length) {
     console.log(`\n  ${amber('No events logged yet.')}`);
@@ -386,7 +542,11 @@ function cmdStatus() {
   console.log(`\n  ${bold(`Listening · last run ${ago} ago`)} ${dim(`(${last.project}, ${last.elapsed}s, ${last.action})`)}\n`);
   console.log(`  ${green(String(sent))} sent   ${dim(`${quiet} stayed quiet`)}${errors ? `   ${red(`${errors} errors`)}` : ''}`);
 
-  const durations = log.filter((e) => e.event === 'Stop').map((e) => e.elapsed).sort((a, b) => a - b);
+  // Keyed on the canonical kind, so every agent's finished turns land in the
+  // same histogram. Older log lines predate `kind` and only ever came from
+  // Claude Code, so they are matched on its event name.
+  const durations = log.filter((e) => (e.kind ? e.kind === 'done' : e.event === 'Stop'))
+    .map((e) => e.elapsed).sort((a, b) => a - b);
   if (durations.length) {
     const at = (p) => durations[Math.min(durations.length - 1, Math.floor(durations.length * p))];
     const over = durations.filter((d) => d >= cfg.threshold).length;
@@ -436,7 +596,7 @@ async function cmdHook() {
   let raw = '';
   for await (const chunk of process.stdin) raw += chunk;
   let payload; try { payload = JSON.parse(raw); } catch { return; }
-  const r = await runHook(payload, { dryRun: flag('dry-run') });
+  const r = await runHook(payload, { dryRun: flag('dry-run'), agent: agentFromArgv() });
   if (flag('dry-run')) console.log(JSON.stringify(r, null, 2));
 }
 
@@ -444,14 +604,16 @@ function usage() {
   console.log(`
 ${bold('agentbuzz')} — know the second your agent needs you
 
-  ${bold('init')}        detect Claude Code, back up and merge hooks, send a test
+  ${bold('init')}        detect your agents, back up and merge hooks, send a test
   ${bold('test')}        send a notification that looks like a real one
   ${bold('status')}      what the hook has been doing, and why it has been quiet
   ${bold('config')}      print config, or ${dim('--threshold <sec>')} / ${dim('--macos on|off')} to change it
   ${bold('uninstall')}   remove only our hooks, restore nothing else
   ${bold('hook')}        internal: the hook entrypoint ${dim('(--dry-run to inspect)')}
 
-  ${dim('init flags:')} --ntfy (deliver via ntfy.sh instead of the app)  --topic <name>
+  ${dim('init flags:')} --agent <ids> (default: every one detected)
+              ${dim(Object.entries(AGENT_TARGETS).map(([id, t]) => `${id} = ${t.label}`).join('  ·  '))}
+              --ntfy (deliver via ntfy.sh instead of the app)  --topic <name>
               --macos (banner on this Mac; on its own, no account needed)
               --no-macos  --threshold <sec>  --server <url>  --yes
 `);

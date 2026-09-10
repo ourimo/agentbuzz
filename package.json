@@ -1,9 +1,12 @@
 {
   "name": "agentbuzz",
-  "version": "1.1.0",
-  "description": "Know the second your agent needs you — Claude Code notifications on your phone and Apple Watch, and answer them from your wrist.",
+  "version": "1.2.0",
+  "description": "Know the second your agent needs you — Claude Code, Codex CLI and Cursor notifications on your phone and Apple Watch, and answer them from your wrist.",
   "keywords": [
     "claude-code",
+    "codex",
+    "codex-cli",
+    "cursor",
     "notifications",
     "hooks",
     "agent",
@@ -35,7 +38,7 @@
     "node": ">=18.17"
   },
   "scripts": {
-    "test": "node test/run.mjs",
+    "test": "node test/run.mjs && node test/install.mjs",
     "grade": "node scripts/grade-summaries.mjs"
   }
 }
